@@ -14,6 +14,8 @@ import {
   activateGameCard,
   clearActiveCardIfCurrent,
   closeVoteRoundIfComplete,
+  getPlayerBySession,
+  getRoundResult,
   joinGameByCode,
   markRoundReadyNext,
   resolveRandomTiebreak,
@@ -299,15 +301,12 @@ export default function ResultPage() {
           return
         }
 
-        const { data: currentPlayer, error: currentPlayerError } = await supabase
-          .from('players')
-          .select('game_id, name')
-          .eq('session_id', sessionId)
-          .eq('active', true)
-          .single()
+        const currentPlayer = await getPlayerBySession(sessionId).catch((playerError) => {
+          console.error('RESULT PLAYER ERROR', playerError)
+          return null
+        })
 
-        if (currentPlayerError || !currentPlayer) {
-          console.error('RESULT PLAYER ERROR', currentPlayerError)
+        if (!currentPlayer) {
           setNeedsGameCode(true)
           setLoading(false)
           return
@@ -315,7 +314,7 @@ export default function ResultPage() {
 
         setCurrentGameId(currentPlayer.game_id)
         const { data: gameData, error: gameError } = await supabase
-          .from('games')
+          .from('public_games')
           .select('id, code, active_card_slug')
           .eq('id', currentPlayer.game_id)
           .single()
@@ -422,7 +421,7 @@ export default function ResultPage() {
           resultRound.tie_player_ids.length === 1
         ) {
           const { data: resolvedWinner, error: resolvedWinnerError } = await supabase
-            .from('players')
+            .from('public_players')
             .select('id, name')
             .eq('id', resultRound.tie_player_ids[0])
             .single()
@@ -446,35 +445,9 @@ export default function ResultPage() {
           return
         }
 
-        const { data: votes, error: votesError } = await supabase
-          .from('votes')
-          .select('voted_player_id, voter_session_id')
-          .eq('vote_round_id', resultRoundId)
-
-        if (votesError) {
-          console.error('RESULT VOTES ERROR', votesError)
-          setError('Error cargando votos')
-          setLoading(false)
-          return
-        }
-
-        const { data: activePlayers, error: activePlayersError } = await supabase
-          .from('players')
-          .select('session_id')
-          .eq('game_id', currentPlayer.game_id)
-          .eq('active', true)
-
-        if (activePlayersError || !activePlayers) {
-          console.error('RESULT ACTIVE PLAYERS ERROR', activePlayersError)
-          setError('No se pudo comprobar si todos habían votado')
-          setLoading(false)
-          return
-        }
-
-        const requiredVoteCount = activePlayers.length
-        const uniqueVoterCount = new Set(
-          (votes || []).map((vote) => vote.voter_session_id).filter(Boolean)
-        ).size
+        const roundResult = await getRoundResult(resultRoundId, sessionId)
+        const requiredVoteCount = roundResult.required_vote_count
+        const uniqueVoterCount = roundResult.vote_count
         const roundIsClosed = resultRound.status === 'closed'
         const roundIsComplete = requiredVoteCount > 0 && uniqueVoterCount >= requiredVoteCount
 
@@ -490,7 +463,7 @@ export default function ResultPage() {
           return
         }
 
-        if (!votes || votes.length === 0) {
+        if (roundResult.vote_count === 0) {
           setWinnerName('')
           setCardType('')
           setShowWinnerName(false)
@@ -502,40 +475,12 @@ export default function ResultPage() {
           return
         }
 
-        const counts: Record<string, number> = {}
-        votes.forEach((vote) => {
-          counts[vote.voted_player_id] = (counts[vote.voted_player_id] || 0) + 1
-        })
+        const winners = roundResult.winners.map((winner) => ({
+          id: winner.id,
+          name: winner.name,
+        }))
 
-        const playerIds = Object.keys(counts)
-
-        const { data: players, error: playersError } = await supabase
-          .from('players')
-          .select('id, name')
-          .in('id', playerIds)
-
-        if (playersError || !players) {
-          console.error('RESULT PLAYERS ERROR', playersError)
-          setError('Error cargando jugadores')
-          setLoading(false)
-          return
-        }
-
-        let maxVotes = 0
-        let winners: Player[] = []
-
-        players.forEach((player: Player) => {
-          const voteCount = counts[player.id] || 0
-
-          if (voteCount > maxVotes) {
-            maxVotes = voteCount
-            winners = [player]
-          } else if (voteCount === maxVotes) {
-            winners.push(player)
-          }
-        })
-
-        if (maxVotes === 0) {
+        if (winners.length === 0) {
           setWinnerName('')
           setCardType('')
           setShowWinnerName(false)
@@ -589,16 +534,25 @@ export default function ResultPage() {
       .on(
         'postgres_changes',
         {
-          event: 'UPDATE',
+          event: '*',
           schema: 'public',
-          table: 'games',
-          filter: `id=eq.${currentGameId}`,
+          table: 'realtime_events',
+          filter: `game_id=eq.${currentGameId}`,
         },
-        (payload) => {
-          const activeCardSlug = payload.new.active_card_slug
+        async () => {
+          const { data: game, error: gameError } = await supabase
+            .from('public_games')
+            .select('active_card_slug')
+            .eq('id', currentGameId)
+            .single()
 
-          if (typeof activeCardSlug === 'string' && activeCardSlug) {
-            redirectToActiveCard(activeCardSlug)
+          if (gameError) {
+            console.error('RESULT ACTIVE CARD REFRESH ERROR', gameError)
+            return
+          }
+
+          if (game?.active_card_slug) {
+            redirectToActiveCard(game.active_card_slug)
           }
         }
       )
@@ -617,27 +571,13 @@ export default function ResultPage() {
       .on(
         'postgres_changes',
         {
-          event: 'UPDATE',
+          event: '*',
           schema: 'public',
-          table: 'vote_rounds',
-          filter: `id=eq.${finalRoundId}`,
+          table: 'realtime_events',
+          filter: `vote_round_id=eq.${finalRoundId}`,
         },
-        (payload) => {
-          const round = payload.new
-
-          if (round.status === 'ready_next' && !roundFinished) {
-            showNextCardPreparation()
-            return
-          }
-
-          if (
-            round.status === 'closed' &&
-            Array.isArray(round.tie_player_ids) &&
-            round.tie_player_ids.length === 1 &&
-            tiedPlayers.length >= 2
-          ) {
-            setLoadKey((key) => key + 1)
-          }
+        () => {
+          setLoadKey((key) => key + 1)
         }
       )
       .subscribe()
@@ -645,22 +585,21 @@ export default function ResultPage() {
     return () => {
       supabase.removeChannel(channel)
     }
-  }, [finalRoundId, roundFinished, showNextCardPreparation, tiedPlayers.length])
+  }, [finalRoundId, roundFinished, showNextCardPreparation])
 
   useEffect(() => {
     if (!finalRoundId || roundFinished) return
+    const currentFinalRoundId = finalRoundId
 
     async function checkRoundStatus() {
-      const { data: round, error: roundError } = await supabase
-        .from('vote_rounds')
-        .select('status')
-        .eq('id', finalRoundId)
-        .single()
+      const sessionId = localStorage.getItem('session_id')
 
-      if (roundError) {
+      if (!sessionId) return
+
+      const round = await getRoundResult(currentFinalRoundId, sessionId).catch((roundError) => {
         console.error('READY NEXT CHECK ERROR', roundError)
-        return
-      }
+        return null
+      })
 
       if (round?.status === 'ready_next') {
         showNextCardPreparation()
@@ -915,7 +854,7 @@ export default function ResultPage() {
 
       const cleanCode = joinCode.trim().toUpperCase()
       const { data: gameData, error: gameError } = await supabase
-        .from('games')
+        .from('public_games')
         .select('id, code')
         .eq('code', cleanCode)
         .single()
@@ -926,10 +865,9 @@ export default function ResultPage() {
       }
 
       const { data: playerList, error: playersError } = await supabase
-        .from('players')
+        .from('public_players')
         .select('id, name')
         .eq('game_id', gameData.id)
-        .eq('active', true)
         .order('created_at', { ascending: true })
 
       if (playersError || !playerList) {

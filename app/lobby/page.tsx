@@ -59,10 +59,9 @@ function LobbyContent() {
 
   const loadPlayers = useCallback(async (currentGameId: string) => {
     const { data: playerList, error: playersError } = await supabase
-      .from('players')
+      .from('public_players')
       .select('id, name, is_host')
       .eq('game_id', currentGameId)
-      .eq('active', true)
       .order('created_at', { ascending: true })
 
     if (playersError) {
@@ -76,7 +75,7 @@ function LobbyContent() {
 
   const loadActiveCard = useCallback(async (currentGameId: string) => {
     const { data: game, error: gameError } = await supabase
-      .from('games')
+      .from('public_games')
       .select('active_card_slug')
       .eq('id', currentGameId)
       .single()
@@ -143,7 +142,7 @@ function LobbyContent() {
       }
 
       const { data: game, error: gameError } = await supabase
-        .from('games')
+        .from('public_games')
         .select('id, code, status, active_card_slug')
         .eq('code', code)
         .single()
@@ -177,27 +176,12 @@ function LobbyContent() {
         {
           event: '*',
           schema: 'public',
-          table: 'players',
+          table: 'realtime_events',
           filter: `game_id=eq.${gameId}`,
         },
         () => {
           loadPlayers(gameId)
-        }
-      )
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'games',
-          filter: `id=eq.${gameId}`,
-        },
-        (payload) => {
-          const activeCardSlug = payload.new.active_card_slug
-
-          if (typeof activeCardSlug === 'string' && activeCardSlug) {
-            redirectToActiveCard(activeCardSlug)
-          }
+          loadActiveCard(gameId)
         }
       )
       .subscribe()

@@ -6,6 +6,8 @@ import { supabase } from '@/lib/supabase'
 import {
   activateGameCard,
   getOrCreateVoteRound,
+  getPlayerBySession,
+  getVoteState,
   joinGameByCode,
 } from '@/lib/game-flow'
 import { generateSessionId, getErrorMessage } from '@/lib/session'
@@ -21,10 +23,6 @@ type CardData = {
 type Player = {
   id: string
   name: string
-}
-
-type ActivePlayer = Player & {
-  session_id: string | null
 }
 
 type Game = {
@@ -43,24 +41,6 @@ type VoteRound = {
   tie_player_ids: string[] | null
 }
 
-async function getVoteCountForRound(roundId: string) {
-  const { data } = await supabase
-    .from('votes')
-    .select('id')
-    .eq('vote_round_id', roundId)
-
-  return (data || []).length
-}
-
-async function getVoterSessionIdsForRound(roundId: string) {
-  const { data } = await supabase
-    .from('votes')
-    .select('voter_session_id')
-    .eq('vote_round_id', roundId)
-
-  return (data || []).map((vote) => vote.voter_session_id)
-}
-
 function hasTiebreakPlayers(round: VoteRound | null) {
   return !!round?.tie_player_ids && round.tie_player_ids.length > 0
 }
@@ -74,29 +54,16 @@ function haveSamePlayers(firstPlayers: Player[], secondPlayers: Player[]) {
   })
 }
 
-function haveSameActivePlayers(
-  firstPlayers: ActivePlayer[],
-  secondPlayers: ActivePlayer[]
+function haveSameMissingVoters(
+  firstPlayers: Player[],
+  secondPlayers: Player[]
 ) {
   if (firstPlayers.length !== secondPlayers.length) return false
 
   return firstPlayers.every((player, index) => {
     const nextPlayer = secondPlayers[index]
-    return (
-      nextPlayer?.id === player.id &&
-      nextPlayer.name === player.name &&
-      nextPlayer.session_id === player.session_id
-    )
+    return nextPlayer?.id === player.id && nextPlayer.name === player.name
   })
-}
-
-function haveSameMissingVoters(
-  firstPlayers: ActivePlayer[],
-  secondPlayers: ActivePlayer[]
-) {
-  if (firstPlayers.length !== secondPlayers.length) return false
-
-  return firstPlayers.every((player, index) => secondPlayers[index]?.id === player.id)
 }
 
 function CardContent() {
@@ -110,11 +77,10 @@ function CardContent() {
   const [card, setCard] = useState<CardData | null>(null)
   const [game, setGame] = useState<Game | null>(null)
   const [players, setPlayers] = useState<Player[]>([])
-  const [activePlayers, setActivePlayers] = useState<ActivePlayer[]>([])
   const [currentPlayerId, setCurrentPlayerId] = useState<string | null>(null)
   const [voteCount, setVoteCount] = useState(0)
   const [requiredVoteCount, setRequiredVoteCount] = useState(0)
-  const [missingVoters, setMissingVoters] = useState<ActivePlayer[]>([])
+  const [missingVoters, setMissingVoters] = useState<Player[]>([])
   const [voteRound, setVoteRound] = useState<VoteRound | null>(null)
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [alreadyVoted, setAlreadyVoted] = useState(false)
@@ -144,24 +110,21 @@ function CardContent() {
 
         setSessionId(sId)
 
-        const { data: player, error: playerError } = await supabase
-          .from('players')
-          .select('id, game_id')
-          .eq('session_id', sId)
-          .eq('active', true)
-          .single()
-
-        if (playerError || !player) {
+        const player = await getPlayerBySession(sId).catch((playerError) => {
           console.error('PLAYER ERROR', playerError)
+          return null
+        })
+
+        if (!player) {
           setNeedsGameCode(true)
           setLoading(false)
           return
         }
 
-        setCurrentPlayerId(player.id)
+        setCurrentPlayerId(player.player_id)
 
         const { data: gameData, error: gameError } = await supabase
-          .from('games')
+          .from('public_games')
           .select('id, code')
           .eq('id', player.game_id)
           .single()
@@ -208,10 +171,9 @@ function CardContent() {
         }
 
         let playersQuery = supabase
-          .from('players')
+          .from('public_players')
           .select('id, name')
           .eq('game_id', gameData.id)
-          .eq('active', true)
 
         if (roundData.tie_player_ids && roundData.tie_player_ids.length > 0) {
           playersQuery = playersQuery.in('id', roundData.tie_player_ids)
@@ -226,53 +188,31 @@ function CardContent() {
           return
         }
 
-        const { data: activePlayerList, error: activePlayerListError } = await supabase
-          .from('players')
-          .select('id, name, session_id')
-          .eq('game_id', gameData.id)
-          .eq('active', true)
-          .order('created_at', { ascending: true })
+        const voteState = await getVoteState(roundData.id, sId).catch((voteStateError) => {
+          console.error('VOTE STATE ERROR', voteStateError)
+          return null
+        })
 
-        if (activePlayerListError || !activePlayerList) {
-          console.error('ACTIVE PLAYER LIST ERROR', activePlayerListError)
-          setError('No se pudo contar a los jugadores activos.')
-          setLoading(false)
-          return
-        }
-
-        const { data: vote, error: voteCheckError } = await supabase
-          .from('votes')
-          .select('id')
-          .eq('vote_round_id', roundData.id)
-          .eq('voter_session_id', sId)
-          .maybeSingle()
-
-        if (voteCheckError) {
-          console.error('VOTE CHECK ERROR', voteCheckError)
+        if (!voteState) {
           setError('No se pudo comprobar tu voto.')
           setLoading(false)
           return
         }
-        const totalVotes = await getVoteCountForRound(roundData.id)
-        const voterSessionIds = await getVoterSessionIdsForRound(roundData.id)
-        const requiredVotes = activePlayerList.length
-        const votedSessionIdSet = new Set(voterSessionIds)
-        const pendingVoters = activePlayerList.filter((activePlayer) => {
-          return !activePlayer.session_id || !votedSessionIdSet.has(activePlayer.session_id)
-        })
 
-        setVoteCount(totalVotes)
-        setAllVoted(totalVotes >= requiredVotes && requiredVotes > 0)
-        setAlreadyVoted(!!vote)
-        setVoteSaved(!!vote)
+        setVoteCount(voteState.vote_count)
+        setAllVoted(
+          voteState.vote_count >= voteState.required_vote_count &&
+            voteState.required_vote_count > 0
+        )
+        setAlreadyVoted(voteState.already_voted)
+        setVoteSaved(voteState.already_voted)
         setVoteRound(roundData)
         localStorage.setItem(`last_round_${slug}`, roundData.id)
         setCard(cardData)
         setGame(gameData)
-        setRequiredVoteCount(requiredVotes)
+        setRequiredVoteCount(voteState.required_vote_count)
         setPlayers(playerList)
-        setActivePlayers(activePlayerList)
-        setMissingVoters(pendingVoters)
+        setMissingVoters(voteState.missing_players)
         setLoading(false)
       } catch (err) {
         console.error('LOAD ERROR', err)
@@ -289,17 +229,17 @@ function CardContent() {
 
     const currentVoteRound = voteRound
     const currentGame = game
+    const currentSessionId = sessionId
 
     async function refreshVoteState() {
-      const totalVotes = await getVoteCountForRound(currentVoteRound.id)
-      const voterSessionIds = await getVoterSessionIdsForRound(currentVoteRound.id)
-      const votedSessionIdSet = new Set(voterSessionIds)
+      if (!currentSessionId) return
+
+      const voteState = await getVoteState(currentVoteRound.id, currentSessionId)
 
       let playersQuery = supabase
-        .from('players')
+        .from('public_players')
         .select('id, name')
         .eq('game_id', currentGame.id)
-        .eq('active', true)
 
       if (
         currentVoteRound.tie_player_ids &&
@@ -315,41 +255,24 @@ function CardContent() {
         return
       }
 
-      const { data: activePlayerList, error: activePlayerListError } = await supabase
-        .from('players')
-        .select('id, name, session_id')
-        .eq('game_id', currentGame.id)
-        .eq('active', true)
-        .order('created_at', { ascending: true })
+      const pendingVoters = voteState.missing_players
+      const nextRequiredVoteCount = voteState.required_vote_count
 
-      if (activePlayerListError || !activePlayerList) {
-        console.error('ACTIVE PLAYERS REFRESH ERROR', activePlayerListError)
-        return
-      }
-
-      const pendingVoters = activePlayerList.filter((activePlayer) => {
-        return !activePlayer.session_id || !votedSessionIdSet.has(activePlayer.session_id)
-      })
-      const nextRequiredVoteCount = activePlayerList.length
-
-      setVoteCount(totalVotes)
+      setVoteCount(voteState.vote_count)
       setPlayers((currentPlayers) => {
         const nextPlayers = playerList || []
         return haveSamePlayers(currentPlayers, nextPlayers) ? currentPlayers : nextPlayers
       })
-      setActivePlayers((currentPlayers) =>
-        haveSameActivePlayers(currentPlayers, activePlayerList)
-          ? currentPlayers
-          : activePlayerList
-      )
       setRequiredVoteCount(nextRequiredVoteCount)
+      setAlreadyVoted(voteState.already_voted)
+      setVoteSaved(voteState.already_voted)
       setMissingVoters((currentMissingVoters) =>
         haveSameMissingVoters(currentMissingVoters, pendingVoters)
           ? currentMissingVoters
           : pendingVoters
       )
 
-      if (totalVotes >= nextRequiredVoteCount && nextRequiredVoteCount > 0) {
+      if (voteState.vote_count >= nextRequiredVoteCount && nextRequiredVoteCount > 0) {
         setAllVoted(true)
       }
     }
@@ -363,7 +286,7 @@ function CardContent() {
         {
           event: '*',
           schema: 'public',
-          table: 'votes',
+          table: 'realtime_events',
           filter: `vote_round_id=eq.${currentVoteRound.id}`,
         },
         refreshVoteState
@@ -373,7 +296,7 @@ function CardContent() {
         {
           event: '*',
           schema: 'public',
-          table: 'players',
+          table: 'realtime_events',
           filter: `game_id=eq.${currentGame.id}`,
         },
         refreshVoteState
@@ -383,7 +306,7 @@ function CardContent() {
     return () => {
       supabase.removeChannel(channel)
     }
-  }, [allVoted, game, voteRound])
+  }, [allVoted, game, sessionId, voteRound])
 
   useEffect(() => {
     if (!allVoted || !voteRound) return
@@ -410,18 +333,17 @@ function CardContent() {
       return
     }
 
-    const totalVotes = await getVoteCountForRound(voteRound.id)
-    const voterSessionIds = await getVoterSessionIdsForRound(voteRound.id)
-    const votedSessionIdSet = new Set(voterSessionIds)
-    const pendingVoters = activePlayers.filter((activePlayer) => {
-      return !activePlayer.session_id || !votedSessionIdSet.has(activePlayer.session_id)
-    })
+    const voteState = await getVoteState(voteRound.id, sessionId)
 
-    setVoteCount(totalVotes)
-    setMissingVoters(pendingVoters)
+    setVoteCount(voteState.vote_count)
+    setRequiredVoteCount(voteState.required_vote_count)
+    setMissingVoters(voteState.missing_players)
     setVoteSaved(true)
     setAlreadyVoted(true)
-    setAllVoted(totalVotes >= requiredVoteCount && requiredVoteCount > 0)
+    setAllVoted(
+      voteState.vote_count >= voteState.required_vote_count &&
+        voteState.required_vote_count > 0
+    )
     setSubmittingVote(false)
   }
 
@@ -451,7 +373,7 @@ function CardContent() {
       const cleanCode = joinCode.trim().toUpperCase()
 
       const { data: gameData, error: gameError } = await supabase
-        .from('games')
+        .from('public_games')
         .select('id, code')
         .eq('code', cleanCode)
         .single()
@@ -462,10 +384,9 @@ function CardContent() {
       }
 
       const { data: playerList, error: playersError } = await supabase
-        .from('players')
+        .from('public_players')
         .select('id, name')
         .eq('game_id', gameData.id)
-        .eq('active', true)
         .order('created_at', { ascending: true })
 
       if (playersError || !playerList) {

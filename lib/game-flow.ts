@@ -5,11 +5,47 @@ type GameJoinResult = {
   code: string
 }
 
+export type PlayerSessionResult = {
+  player_id: string
+  game_id: string
+  name: string
+  code: string
+}
+
 export type VoteRoundResult = {
   id: string
   status: string
   tie_player_ids: string[] | null
   card_id: string
+}
+
+export type VoteStateResult = {
+  vote_count: number
+  required_vote_count: number
+  already_voted: boolean
+  missing_players: { id: string; name: string }[]
+}
+
+export type RoundResult = {
+  round_id: string
+  status: string
+  winners: { id: string; name: string; votes: number }[]
+  tied_players: { id: string; name: string }[]
+  vote_count: number
+  required_vote_count: number
+}
+
+export async function getPlayerBySession(
+  sessionId: string
+): Promise<PlayerSessionResult> {
+  const { data, error } = await supabase
+    .rpc('get_player_by_session', {
+      p_session_id: sessionId,
+    })
+    .single()
+
+  if (error) throw error
+  return data as PlayerSessionResult
 }
 
 export async function createGameWithHost(
@@ -92,6 +128,36 @@ export async function getOrCreateVoteRound(
 
   if (error) throw error
   return data as VoteRoundResult
+}
+
+export async function getVoteState(
+  roundId: string,
+  sessionId: string
+): Promise<VoteStateResult> {
+  const { data, error } = await supabase
+    .rpc('get_vote_state', {
+      p_vote_round_id: roundId,
+      p_session_id: sessionId,
+    })
+    .single()
+
+  if (error) throw error
+  return data as VoteStateResult
+}
+
+export async function getRoundResult(
+  roundId: string,
+  sessionId: string
+): Promise<RoundResult> {
+  const { data, error } = await supabase
+    .rpc('get_round_result', {
+      p_vote_round_id: roundId,
+      p_session_id: sessionId,
+    })
+    .single()
+
+  if (error) throw error
+  return data as RoundResult
 }
 
 export async function closeVoteRoundIfComplete(roundId: string, sessionId: string) {
