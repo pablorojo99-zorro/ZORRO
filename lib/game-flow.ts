@@ -10,6 +10,7 @@ export type PlayerSessionResult = {
   game_id: string
   name: string
   code: string
+  is_host: boolean
 }
 
 export type VoteRoundResult = {
@@ -36,16 +37,36 @@ export type RoundResult = {
 }
 
 export async function getPlayerBySession(
-  sessionId: string
+  sessionId: string,
+  code?: string | null
 ): Promise<PlayerSessionResult> {
   const { data, error } = await supabase
     .rpc('get_player_by_session', {
       p_session_id: sessionId,
+      p_code: code || null,
     })
     .single()
 
   if (error) throw error
   return data as PlayerSessionResult
+}
+
+export async function heartbeatPlayer(sessionId: string, gameId?: string | null) {
+  const { error } = await supabase.rpc('heartbeat_player', {
+    p_session_id: sessionId,
+    p_game_id: gameId || null,
+  })
+
+  if (error) throw error
+}
+
+export async function removePlayerFromGame(hostSessionId: string, playerId: string) {
+  const { error } = await supabase.rpc('remove_player_from_game', {
+    p_host_session_id: hostSessionId,
+    p_player_id: playerId,
+  })
+
+  if (error) throw error
 }
 
 export async function createGameWithHost(

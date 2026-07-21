@@ -28,6 +28,28 @@ export function generateSessionId() {
   ].join('-')
 }
 
+export function getStoredSessionId() {
+  return localStorage.getItem('session_id')
+}
+
+export function getOrCreateSessionId() {
+  const existingSessionId = getStoredSessionId()
+
+  if (existingSessionId) {
+    return existingSessionId
+  }
+
+  const sessionId = generateSessionId()
+  localStorage.setItem('session_id', sessionId)
+  return sessionId
+}
+
+export function storeGameSession(sessionId: string, gameCode: string, playerName: string) {
+  localStorage.setItem('session_id', sessionId)
+  localStorage.setItem('game_code', gameCode)
+  localStorage.setItem('player_name', playerName)
+}
+
 export function getErrorMessage(err: unknown) {
   if (err instanceof Error) return err.message
 

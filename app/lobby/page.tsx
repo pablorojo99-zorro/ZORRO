@@ -8,7 +8,13 @@ import {
   getCardScanMessage,
 } from '@/lib/active-card'
 import { cardExists, createCardSlugFromCode } from '@/lib/cards'
-import { activateGameCard } from '@/lib/game-flow'
+import {
+  activateGameCard,
+  getPlayerBySession,
+  removePlayerFromGame,
+} from '@/lib/game-flow'
+import { getErrorMessage, getStoredSessionId } from '@/lib/session'
+import { usePlayerHeartbeat } from '@/lib/use-player-heartbeat'
 import Image from 'next/image'
 import { useRouter, useSearchParams } from 'next/navigation'
 
@@ -16,6 +22,7 @@ type Player = {
   id: string
   name: string
   is_host: boolean
+  presence_status: 'online' | 'reconnecting' | 'offline'
 }
 
 function LobbyContent() {
@@ -25,12 +32,16 @@ function LobbyContent() {
 
   const [players, setPlayers] = useState<Player[]>([])
   const [gameId, setGameId] = useState<string | null>(null)
+  const [currentPlayerId, setCurrentPlayerId] = useState<string | null>(null)
+  const [currentPlayerIsHost, setCurrentPlayerIsHost] = useState(false)
   const [cardCode, setCardCode] = useState('')
   const [cardScanMessage, setCardScanMessage] = useState('')
   const [openingCard, setOpeningCard] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [removingPlayerId, setRemovingPlayerId] = useState<string | null>(null)
   const redirectingToCardRef = useRef(false)
+  usePlayerHeartbeat(gameId)
 
   const redirectToActiveCard = useCallback((activeCardValue: string) => {
     const activeCardSlug = getActiveCardSlug(activeCardValue)
@@ -60,7 +71,7 @@ function LobbyContent() {
   const loadPlayers = useCallback(async (currentGameId: string) => {
     const { data: playerList, error: playersError } = await supabase
       .from('public_players')
-      .select('id, name, is_host')
+      .select('id, name, is_host, presence_status')
       .eq('game_id', currentGameId)
       .order('created_at', { ascending: true })
 
@@ -133,6 +144,27 @@ function LobbyContent() {
     router.push(`/card/${nextCardSlug}`)
   }
 
+  async function handleRemovePlayer(playerId: string) {
+    const sessionId = getStoredSessionId()
+
+    if (!sessionId || removingPlayerId) return
+
+    setRemovingPlayerId(playerId)
+    setError('')
+
+    try {
+      await removePlayerFromGame(sessionId, playerId)
+      if (gameId) {
+        await loadPlayers(gameId)
+      }
+    } catch (err) {
+      console.error('REMOVE PLAYER ERROR', err)
+      setError(`No se pudo quitar al jugador: ${getErrorMessage(err)}`)
+    } finally {
+      setRemovingPlayerId(null)
+    }
+  }
+
   useEffect(() => {
     async function loadLobby() {
       if (!code) {
@@ -159,6 +191,18 @@ function LobbyContent() {
       }
 
       setGameId(game.id)
+
+      const sessionId = getStoredSessionId()
+      if (sessionId) {
+        const player = await getPlayerBySession(sessionId, game.code).catch((playerError) => {
+          console.error('LOBBY PLAYER SESSION ERROR', playerError)
+          return null
+        })
+
+        setCurrentPlayerId(player?.player_id || null)
+        setCurrentPlayerIsHost(!!player?.is_host)
+      }
+
       await loadPlayers(game.id)
       setLoading(false)
     }
@@ -228,9 +272,22 @@ function LobbyContent() {
                     className="flex items-center justify-between rounded-2xl border border-neutral-200 px-4 py-3"
                   >
                     <span>{player.name}</span>
-                    {player.is_host ? (
-                      <span className="text-sm text-neutral-500">Host</span>
-                    ) : null}
+                    <span className="flex items-center gap-2 text-sm text-neutral-500">
+                      {player.presence_status === 'online' ? 'Online' : null}
+                      {player.presence_status === 'reconnecting' ? 'Reconectando' : null}
+                      {player.presence_status === 'offline' ? 'Sin conexión' : null}
+                      {player.is_host ? 'Host' : null}
+                      {currentPlayerIsHost && player.id !== currentPlayerId ? (
+                        <button
+                          type="button"
+                          onClick={() => handleRemovePlayer(player.id)}
+                          disabled={removingPlayerId === player.id}
+                          className="rounded-full border border-neutral-300 px-2 py-1 text-xs text-neutral-700 disabled:opacity-40"
+                        >
+                          Quitar
+                        </button>
+                      ) : null}
+                    </span>
                   </li>
                 ))}
               </ul>

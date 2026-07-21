@@ -21,7 +21,12 @@ import {
   resolveRandomTiebreak,
   startTiebreakRound,
 } from '@/lib/game-flow'
-import { generateSessionId, getErrorMessage } from '@/lib/session'
+import {
+  getErrorMessage,
+  getOrCreateSessionId,
+  storeGameSession,
+} from '@/lib/session'
+import { usePlayerHeartbeat } from '@/lib/use-player-heartbeat'
 import Image from 'next/image'
 import { useParams, useRouter } from 'next/navigation'
 
@@ -193,6 +198,7 @@ export default function ResultPage() {
   const [error, setError] = useState<string | null>(null)
   const redirectingToCardRef = useRef(false)
   const slotTimersRef = useRef<ReturnType<typeof setTimeout>[]>([])
+  usePlayerHeartbeat(currentGameId)
 
   const redirectToActiveCard = useCallback((activeCardValue: string) => {
     const activeCardSlug = getActiveCardSlug(activeCardValue)
@@ -301,7 +307,8 @@ export default function ResultPage() {
           return
         }
 
-        const currentPlayer = await getPlayerBySession(sessionId).catch((playerError) => {
+        const storedGameCode = localStorage.getItem('game_code')
+        const currentPlayer = await getPlayerBySession(sessionId, storedGameCode).catch((playerError) => {
           console.error('RESULT PLAYER ERROR', playerError)
           return null
         })
@@ -564,7 +571,11 @@ export default function ResultPage() {
   }, [currentGameId, redirectToActiveCard])
 
   useEffect(() => {
-    if (!finalRoundId) return
+    if (!finalRoundId || roundFinished) return
+
+    const refreshIntervalId = window.setInterval(() => {
+      setLoadKey((key) => key + 1)
+    }, 15000)
 
     const channel = supabase
       .channel(`result-round:${finalRoundId}`)
@@ -583,6 +594,7 @@ export default function ResultPage() {
       .subscribe()
 
     return () => {
+      window.clearInterval(refreshIntervalId)
       supabase.removeChannel(channel)
     }
   }, [finalRoundId, roundFinished, showNextCardPreparation])
@@ -831,9 +843,7 @@ export default function ResultPage() {
   }
 
   function finishJoinFromResult(newSessionId: string, cleanCode: string, playerName: string) {
-    localStorage.setItem('session_id', newSessionId)
-    localStorage.setItem('game_code', cleanCode)
-    localStorage.setItem('player_name', playerName)
+    storeGameSession(newSessionId, cleanCode, playerName)
 
     setNeedsGameCode(false)
     setLoading(true)
@@ -900,7 +910,7 @@ export default function ResultPage() {
     try {
       setJoiningGame(true)
 
-      const newSessionId = generateSessionId()
+      const newSessionId = getOrCreateSessionId()
       const joinedGame = await joinGameByCode(joinGame.code, newSessionId, joinName.trim())
 
       finishJoinFromResult(newSessionId, joinedGame.code, joinName.trim())

@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import { createGameWithHost, joinGameByCode } from '@/lib/game-flow'
-import { generateSessionId, getErrorMessage } from '@/lib/session'
+import { getErrorMessage, getOrCreateSessionId, storeGameSession } from '@/lib/session'
 import Image from 'next/image'
 import { useRouter } from 'next/navigation'
 
@@ -46,7 +46,7 @@ export default function HomePage() {
     try {
       setLoadingCreate(true)
 
-      const sessionId = generateSessionId()
+      const sessionId = getOrCreateSessionId()
       let code = generateCode()
       let game: { game_id: string; code: string } | null = null
 
@@ -70,9 +70,7 @@ export default function HomePage() {
         throw new Error('No se pudo generar un código de partida')
       }
 
-      localStorage.setItem('session_id', sessionId)
-      localStorage.setItem('game_code', game.code)
-      localStorage.setItem('player_name', name.trim())
+      storeGameSession(sessionId, game.code, name.trim())
 
       router.push(`/lobby?code=${game.code}`)
     } catch (err) {
@@ -101,13 +99,11 @@ export default function HomePage() {
       setLoadingJoin(true)
 
       const cleanCode = joinCode.trim().toUpperCase()
-      const sessionId = generateSessionId()
+      const sessionId = getOrCreateSessionId()
 
       const game = await joinGameByCode(cleanCode, sessionId, name.trim())
 
-      localStorage.setItem('session_id', sessionId)
-      localStorage.setItem('game_code', game.code)
-      localStorage.setItem('player_name', name.trim())
+      storeGameSession(sessionId, game.code, name.trim())
 
       router.push(`/lobby?code=${game.code}`)
     } catch (err) {

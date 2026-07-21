@@ -10,7 +10,12 @@ import {
   getVoteState,
   joinGameByCode,
 } from '@/lib/game-flow'
-import { generateSessionId, getErrorMessage } from '@/lib/session'
+import {
+  getErrorMessage,
+  getOrCreateSessionId,
+  storeGameSession,
+} from '@/lib/session'
+import { usePlayerHeartbeat } from '@/lib/use-player-heartbeat'
 import Image from 'next/image'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
 
@@ -96,6 +101,7 @@ function CardContent() {
   const [loadKey, setLoadKey] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  usePlayerHeartbeat(game?.id || null)
 
   useEffect(() => {
     async function load() {
@@ -110,7 +116,8 @@ function CardContent() {
 
         setSessionId(sId)
 
-        const player = await getPlayerBySession(sId).catch((playerError) => {
+        const storedGameCode = localStorage.getItem('game_code')
+        const player = await getPlayerBySession(sId, storedGameCode).catch((playerError) => {
           console.error('PLAYER ERROR', playerError)
           return null
         })
@@ -278,6 +285,7 @@ function CardContent() {
     }
 
     refreshVoteState()
+    const refreshIntervalId = window.setInterval(refreshVoteState, 15000)
 
     const channel = supabase
       .channel(`card:${currentVoteRound.id}`)
@@ -304,6 +312,7 @@ function CardContent() {
       .subscribe()
 
     return () => {
+      window.clearInterval(refreshIntervalId)
       supabase.removeChannel(channel)
     }
   }, [allVoted, game, sessionId, voteRound])
@@ -348,9 +357,7 @@ function CardContent() {
   }
 
   function finishJoinFromCard(newSessionId: string, cleanCode: string, playerName: string) {
-    localStorage.setItem('session_id', newSessionId)
-    localStorage.setItem('game_code', cleanCode)
-    localStorage.setItem('player_name', playerName)
+    storeGameSession(newSessionId, cleanCode, playerName)
 
     setSessionId(newSessionId)
     setNeedsGameCode(false)
@@ -419,7 +426,7 @@ function CardContent() {
     try {
       setJoiningGame(true)
 
-      const newSessionId = generateSessionId()
+      const newSessionId = getOrCreateSessionId()
 
       const joinedGame = await joinGameByCode(joinGame.code, newSessionId, joinName.trim())
 
