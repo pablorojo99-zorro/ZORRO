@@ -844,7 +844,7 @@ export default function ResultPage() {
       tiebreakRoundId = await startTiebreakRound(finalRoundId, sessionId, tiedPlayerIds)
     } catch (tiebreakError) {
       console.error('TIEBREAK ROUND ERROR', tiebreakError)
-      setError('No se pudo crear el desempate')
+      setError(`No se pudo crear el desempate: ${getErrorMessage(tiebreakError)}`)
       setStartingTiebreak(false)
       return
     }
@@ -877,7 +877,7 @@ export default function ResultPage() {
       )
     } catch (updateError) {
       console.error('RANDOM TIEBREAK UPDATE ERROR', updateError)
-      setError('No se pudo resolver el desempate aleatorio')
+      setError(`No se pudo resolver el desempate aleatorio: ${getErrorMessage(updateError)}`)
       setResolvingRandomTiebreak(false)
       return
     }
