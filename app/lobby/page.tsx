@@ -11,6 +11,7 @@ import { cardExists, createCardSlugFromCode } from '@/lib/cards'
 import {
   activateGameCard,
   getPlayerBySession,
+  joinGameByCode,
   removePlayerFromGame,
 } from '@/lib/game-flow'
 import { getErrorMessage, getStoredSessionId } from '@/lib/session'
@@ -132,11 +133,33 @@ function LobbyContent() {
       return
     }
 
+    if (!currentPlayerId) {
+      const storedPlayerName = localStorage.getItem('player_name')
+
+      if (!code || !storedPlayerName) {
+        setError('Vuelve a entrar en la partida antes de abrir carta.')
+        setOpeningCard(false)
+        return
+      }
+
+      try {
+        await joinGameByCode(code, sessionId, storedPlayerName)
+        const player = await getPlayerBySession(sessionId, code)
+        setCurrentPlayerId(player.player_id)
+        setCurrentPlayerIsHost(player.is_host)
+      } catch (err) {
+        console.error('LOBBY RECONNECT BEFORE CARD ERROR', err)
+        setError(`No se pudo recuperar tu jugador: ${getErrorMessage(err)}`)
+        setOpeningCard(false)
+        return
+      }
+    }
+
     try {
       await activateGameCard(gameId, sessionId, nextCardSlug)
     } catch (err) {
       console.error('ACTIVE CARD UPDATE ERROR', err)
-      setError('No se pudo abrir la carta.')
+      setError(`No se pudo abrir la carta: ${getErrorMessage(err)}`)
       setOpeningCard(false)
       return
     }
@@ -194,10 +217,23 @@ function LobbyContent() {
 
       const sessionId = getStoredSessionId()
       if (sessionId) {
-        const player = await getPlayerBySession(sessionId, game.code).catch((playerError) => {
+        let player = await getPlayerBySession(sessionId, game.code).catch((playerError) => {
           console.error('LOBBY PLAYER SESSION ERROR', playerError)
           return null
         })
+
+        if (!player) {
+          const storedPlayerName = localStorage.getItem('player_name')
+
+          if (storedPlayerName) {
+            player = await joinGameByCode(game.code, sessionId, storedPlayerName)
+              .then(() => getPlayerBySession(sessionId, game.code))
+              .catch((reconnectError) => {
+                console.error('LOBBY AUTO RECONNECT ERROR', reconnectError)
+                return null
+              })
+          }
+        }
 
         setCurrentPlayerId(player?.player_id || null)
         setCurrentPlayerIsHost(!!player?.is_host)
