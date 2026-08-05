@@ -198,6 +198,7 @@ export default function ResultPage() {
   const [error, setError] = useState<string | null>(null)
   const redirectingToCardRef = useRef(false)
   const slotTimersRef = useRef<ReturnType<typeof setTimeout>[]>([])
+  const displayedResultKeyRef = useRef<string | null>(null)
   usePlayerHeartbeat(currentGameId)
 
   const redirectToActiveCard = useCallback((activeCardValue: string) => {
@@ -407,6 +408,7 @@ export default function ResultPage() {
         }
 
         if (resultRound.status === 'ready_next') {
+          displayedResultKeyRef.current = null
           setWinnerName('')
           setCardType('')
           setShowWinnerName(false)
@@ -440,14 +442,22 @@ export default function ResultPage() {
             return
           }
 
-          setShowWinnerName(false)
-          setShowCardType(false)
-          resetSlotAnimation()
+          const nextCardType = getCardTypeFromRound(resultRoundId)
+          const nextResultKey = `winner:${resultRoundId}:${resolvedWinner.id}:${nextCardType}`
+
           setWinnerName(resolvedWinner.name)
-          setCardType(getCardTypeFromRound(resultRoundId))
+          setCardType(nextCardType)
           setTiedPlayers([])
           setWinnerText('')
-          setAnimationKey((key) => key + 1)
+
+          if (displayedResultKeyRef.current !== nextResultKey) {
+            displayedResultKeyRef.current = nextResultKey
+            setShowWinnerName(false)
+            setShowCardType(false)
+            resetSlotAnimation()
+            setAnimationKey((key) => key + 1)
+          }
+
           setLoading(false)
           return
         }
@@ -459,6 +469,7 @@ export default function ResultPage() {
         const roundIsComplete = requiredVoteCount > 0 && uniqueVoterCount >= requiredVoteCount
 
         if (!roundIsClosed && !roundIsComplete) {
+          displayedResultKeyRef.current = null
           setWinnerName('')
           setCardType('')
           setShowWinnerName(false)
@@ -471,6 +482,7 @@ export default function ResultPage() {
         }
 
         if (roundResult.vote_count === 0) {
+          displayedResultKeyRef.current = null
           setWinnerName('')
           setCardType('')
           setShowWinnerName(false)
@@ -488,6 +500,7 @@ export default function ResultPage() {
         }))
 
         if (winners.length === 0) {
+          displayedResultKeyRef.current = null
           setWinnerName('')
           setCardType('')
           setShowWinnerName(false)
@@ -496,15 +509,23 @@ export default function ResultPage() {
           setTiedPlayers([])
           setWinnerText('Todavía no hay votos')
         } else if (winners.length === 1) {
-          setShowWinnerName(false)
-          setShowCardType(false)
-          resetSlotAnimation()
+          const nextCardType = getCardTypeFromRound(resultRoundId)
+          const nextResultKey = `winner:${resultRoundId}:${winners[0].id}:${nextCardType}`
+
           setWinnerName(winners[0].name)
-          setCardType(getCardTypeFromRound(resultRoundId))
+          setCardType(nextCardType)
           setTiedPlayers([])
           setWinnerText('')
-          setAnimationKey((key) => key + 1)
+
+          if (displayedResultKeyRef.current !== nextResultKey) {
+            displayedResultKeyRef.current = nextResultKey
+            setShowWinnerName(false)
+            setShowCardType(false)
+            resetSlotAnimation()
+            setAnimationKey((key) => key + 1)
+          }
         } else {
+          displayedResultKeyRef.current = `tie:${resultRoundId}:${winners.map((winner) => winner.id).join(',')}`
           setWinnerName('')
           setCardType('')
           setShowWinnerName(false)
