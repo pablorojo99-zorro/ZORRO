@@ -784,10 +784,34 @@ export default function ResultPage() {
     }
 
     try {
+      let player = await getPlayerBySession(sessionId, currentGameCode || null).catch((playerError) => {
+        console.error('NEXT CARD PLAYER SESSION ERROR', playerError)
+        return null
+      })
+
+      if (!player && currentGameCode) {
+        const storedPlayerName = localStorage.getItem('player_name')
+
+        if (storedPlayerName) {
+          player = await joinGameByCode(currentGameCode, sessionId, storedPlayerName)
+            .then(() => getPlayerBySession(sessionId, currentGameCode))
+            .catch((reconnectError) => {
+              console.error('NEXT CARD RECONNECT ERROR', reconnectError)
+              return null
+            })
+        }
+      }
+
+      if (!player || player.game_id !== currentGameId) {
+        setError('Vuelve a entrar en la partida antes de abrir la siguiente carta')
+        setOpeningNextCard(false)
+        return
+      }
+
       await activateGameCard(currentGameId, sessionId, nextCardSlug)
     } catch (activeCardError) {
       console.error('NEXT ACTIVE CARD ERROR', activeCardError)
-      setError('No se pudo abrir la siguiente carta')
+      setError(`No se pudo abrir la siguiente carta: ${getErrorMessage(activeCardError)}`)
       setOpeningNextCard(false)
       return
     }
