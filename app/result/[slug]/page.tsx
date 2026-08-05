@@ -201,7 +201,7 @@ export default function ResultPage() {
   const displayedResultKeyRef = useRef<string | null>(null)
   usePlayerHeartbeat(currentGameId)
 
-  const redirectToActiveCard = useCallback((activeCardValue: string) => {
+  const redirectToActiveCard = useCallback((activeCardValue: string, gameCode?: string | null) => {
     const activeCardSlug = getActiveCardSlug(activeCardValue)
     const activeCardRoundId = getActiveCardRoundId(activeCardValue)
 
@@ -222,6 +222,10 @@ export default function ResultPage() {
         round: activeCardRoundId,
       })
 
+      if (gameCode) {
+        nextParams.set('code', gameCode)
+      }
+
       router.replace(`/card/${activeCardSlug}?${nextParams.toString()}`)
       return
     }
@@ -229,7 +233,13 @@ export default function ResultPage() {
     setCardScanMessage(getCardScanMessage(activeCardValue))
 
     setTimeout(() => {
-      router.replace(`/card/${activeCardSlug}?auto=1`)
+      const nextParams = new URLSearchParams({ auto: '1' })
+
+      if (gameCode) {
+        nextParams.set('code', gameCode)
+      }
+
+      router.replace(`/card/${activeCardSlug}?${nextParams.toString()}`)
     }, 1200)
   }, [finalRoundId, router, slug])
 
@@ -333,10 +343,22 @@ export default function ResultPage() {
           setCurrentGameCode(gameData.code)
 
           const activeCardRoundId = getActiveCardRoundId(gameData.active_card_slug)
+          const activeCardSlug = getActiveCardSlug(gameData.active_card_slug)
           const currentResultRoundId = roundFromQuery || roundFromStorage
 
           if (
-            getActiveCardSlug(gameData.active_card_slug) === slug &&
+            activeCardSlug &&
+            (
+              activeCardSlug !== slug ||
+              (activeCardRoundId && activeCardRoundId !== currentResultRoundId)
+            )
+          ) {
+            redirectToActiveCard(gameData.active_card_slug, gameData.code)
+            return
+          }
+
+          if (
+            activeCardSlug === slug &&
             (!activeCardRoundId || activeCardRoundId === currentResultRoundId)
           ) {
             try {
@@ -552,7 +574,7 @@ export default function ResultPage() {
     }
 
     loadResults()
-  }, [slug, resetSlotAnimation, showNextCardPreparation, loadKey])
+  }, [slug, resetSlotAnimation, showNextCardPreparation, redirectToActiveCard, loadKey])
 
   useEffect(() => {
     if (!currentGameId) return
@@ -580,7 +602,7 @@ export default function ResultPage() {
           }
 
           if (game?.active_card_slug) {
-            redirectToActiveCard(game.active_card_slug)
+            redirectToActiveCard(game.active_card_slug, currentGameCode)
           }
         }
       )
@@ -589,7 +611,7 @@ export default function ResultPage() {
     return () => {
       supabase.removeChannel(channel)
     }
-  }, [currentGameId, redirectToActiveCard])
+  }, [currentGameCode, currentGameId, redirectToActiveCard])
 
   useEffect(() => {
     if (!finalRoundId || roundFinished) return
@@ -850,7 +872,13 @@ export default function ResultPage() {
     }
 
     localStorage.setItem(`last_round_${slug}`, tiebreakRoundId)
-    router.push(`/card/${slug}?auto=1&round=${tiebreakRoundId}`)
+    const nextParams = new URLSearchParams({ auto: '1', round: tiebreakRoundId })
+
+    if (currentGameCode) {
+      nextParams.set('code', currentGameCode)
+    }
+
+    router.push(`/card/${slug}?${nextParams.toString()}`)
   }
 
   async function handleRandomTiebreak() {
