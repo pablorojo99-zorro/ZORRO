@@ -303,7 +303,7 @@ function CardContent() {
     }
 
     refreshVoteState()
-    const refreshIntervalId = window.setInterval(refreshVoteState, 15000)
+    const refreshIntervalId = window.setInterval(refreshVoteState, 3000)
 
     const channel = supabase
       .channel(`card:${currentVoteRound.id}`)

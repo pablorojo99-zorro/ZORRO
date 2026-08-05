@@ -596,7 +596,7 @@ export default function ResultPage() {
 
     const refreshIntervalId = window.setInterval(() => {
       setLoadKey((key) => key + 1)
-    }, 15000)
+    }, 3000)
 
     const channel = supabase
       .channel(`result-round:${finalRoundId}`)
