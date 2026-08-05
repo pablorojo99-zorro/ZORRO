@@ -44,7 +44,7 @@ function LobbyContent() {
   const redirectingToCardRef = useRef(false)
   usePlayerHeartbeat(gameId)
 
-  const redirectToActiveCard = useCallback((activeCardValue: string) => {
+  const redirectToActiveCard = useCallback((activeCardValue: string, gameCode?: string | null) => {
     const activeCardSlug = getActiveCardSlug(activeCardValue)
     const activeCardRoundId = getActiveCardRoundId(activeCardValue)
 
@@ -53,10 +53,11 @@ function LobbyContent() {
     redirectingToCardRef.current = true
 
     if (activeCardRoundId) {
-      const nextParams = new URLSearchParams({
-        auto: '1',
-        round: activeCardRoundId,
-      })
+      const nextParams = new URLSearchParams({ auto: '1', round: activeCardRoundId })
+
+      if (gameCode) {
+        nextParams.set('code', gameCode)
+      }
 
       router.replace(`/card/${activeCardSlug}?${nextParams.toString()}`)
       return
@@ -65,7 +66,13 @@ function LobbyContent() {
     setCardScanMessage(getCardScanMessage(activeCardValue))
 
     setTimeout(() => {
-      router.replace(`/card/${activeCardSlug}?auto=1`)
+      const nextParams = new URLSearchParams({ auto: '1' })
+
+      if (gameCode) {
+        nextParams.set('code', gameCode)
+      }
+
+      router.replace(`/card/${activeCardSlug}?${nextParams.toString()}`)
     }, 1200)
   }, [router])
 
@@ -98,9 +105,9 @@ function LobbyContent() {
     }
 
     if (game?.active_card_slug) {
-      redirectToActiveCard(game.active_card_slug)
+      redirectToActiveCard(game.active_card_slug, code)
     }
-  }, [redirectToActiveCard])
+  }, [code, redirectToActiveCard])
 
   async function handleGoToCardByCode() {
     const nextCardSlug = createCardSlugFromCode(cardCode)
@@ -208,11 +215,6 @@ function LobbyContent() {
         return
       }
 
-      if (game.active_card_slug) {
-        redirectToActiveCard(game.active_card_slug)
-        return
-      }
-
       setGameId(game.id)
 
       const sessionId = getStoredSessionId()
@@ -237,6 +239,11 @@ function LobbyContent() {
 
         setCurrentPlayerId(player?.player_id || null)
         setCurrentPlayerIsHost(!!player?.is_host)
+      }
+
+      if (game.active_card_slug) {
+        redirectToActiveCard(game.active_card_slug, game.code)
+        return
       }
 
       await loadPlayers(game.id)

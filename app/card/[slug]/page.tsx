@@ -78,6 +78,7 @@ function CardContent() {
   const slug = params.slug as string
   const roundFromQuery = searchParams.get('round')
   const cameFromAutoRedirect = searchParams.get('auto') === '1'
+  const codeFromQuery = searchParams.get('code')
 
   const [card, setCard] = useState<CardData | null>(null)
   const [game, setGame] = useState<Game | null>(null)
@@ -116,11 +117,24 @@ function CardContent() {
 
         setSessionId(sId)
 
-        const storedGameCode = localStorage.getItem('game_code')
-        const player = await getPlayerBySession(sId, storedGameCode).catch((playerError) => {
+        const targetGameCode = codeFromQuery || localStorage.getItem('game_code')
+        let player = await getPlayerBySession(sId, targetGameCode).catch((playerError) => {
           console.error('PLAYER ERROR', playerError)
           return null
         })
+
+        if (!player && targetGameCode) {
+          const storedPlayerName = localStorage.getItem('player_name')
+
+          if (storedPlayerName) {
+            player = await joinGameByCode(targetGameCode, sId, storedPlayerName)
+              .then(() => getPlayerBySession(sId, targetGameCode))
+              .catch((reconnectError) => {
+                console.error('CARD AUTO RECONNECT ERROR', reconnectError)
+                return null
+              })
+          }
+        }
 
         if (!player) {
           setNeedsGameCode(true)
@@ -129,6 +143,10 @@ function CardContent() {
         }
 
         setCurrentPlayerId(player.player_id)
+
+        if (targetGameCode) {
+          storeGameSession(sId, targetGameCode, player.name)
+        }
 
         const { data: gameData, error: gameError } = await supabase
           .from('public_games')
@@ -229,7 +247,7 @@ function CardContent() {
     }
 
     load()
-  }, [slug, roundFromQuery, cameFromAutoRedirect, loadKey, router])
+  }, [slug, roundFromQuery, cameFromAutoRedirect, codeFromQuery, loadKey, router])
 
   useEffect(() => {
     if (allVoted || !voteRound || !game) return
