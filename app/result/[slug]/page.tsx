@@ -1274,7 +1274,7 @@ export default function ResultPage() {
                     Siguiente carta
                   </p>
                   <p className="mt-1 text-sm text-neutral-500">
-                    Escanea o introduce el número de la siguiente carta Zorro.
+                    Escanea o introduce el número de la siguiente carta de EL GALLINERO.
                   </p>
 
                   <div className="mt-4 flex items-center gap-2">

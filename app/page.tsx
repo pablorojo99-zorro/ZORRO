@@ -128,7 +128,7 @@ export default function HomePage() {
             className="absolute right-5 top-4 h-[60px] w-[60px] opacity-75"
           />
 
-          <h1 className="pr-12 text-3xl font-bold tracking-tight">ZORRO</h1>
+          <h1 className="pr-12 text-3xl font-bold tracking-tight">EL GALLINERO</h1>
           <p className="mt-2 text-sm text-neutral-600">
             Crea una partida o únete con un código.
           </p>

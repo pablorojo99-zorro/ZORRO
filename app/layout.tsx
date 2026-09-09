@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "ZORRO",
+  title: "EL GALLINERO",
   description: "Juego de votación por QR",
 };
 
