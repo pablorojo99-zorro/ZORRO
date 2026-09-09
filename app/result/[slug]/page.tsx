@@ -183,6 +183,8 @@ export default function ResultPage() {
   const [currentGameId, setCurrentGameId] = useState<string | null>(null)
   const [currentGameCode, setCurrentGameCode] = useState('')
   const [nextCardCode, setNextCardCode] = useState('')
+  const [validatedNextCardSlug, setValidatedNextCardSlug] = useState<string | null>(null)
+  const [validatingNextCard, setValidatingNextCard] = useState(false)
   const [cardScanMessage, setCardScanMessage] = useState('')
   const [needsGameCode, setNeedsGameCode] = useState(false)
   const [joinCode, setJoinCode] = useState('')
@@ -200,6 +202,32 @@ export default function ResultPage() {
   const slotTimersRef = useRef<ReturnType<typeof setTimeout>[]>([])
   const displayedResultKeyRef = useRef<string | null>(null)
   usePlayerHeartbeat(currentGameId)
+
+  useEffect(() => {
+    const candidateSlug = createCardSlugFromCode(nextCardCode)
+
+    if (!showNextCardForm || !candidateSlug) return
+
+    let cancelled = false
+
+    const validationTimer = setTimeout(() => {
+      cardExists(candidateSlug)
+        .then((exists) => {
+          if (!cancelled && exists) setValidatedNextCardSlug(candidateSlug)
+        })
+        .catch((validationError) => {
+          console.error('NEXT CARD INPUT VALIDATION ERROR', validationError)
+        })
+        .finally(() => {
+          if (!cancelled) setValidatingNextCard(false)
+        })
+    }, 200)
+
+    return () => {
+      cancelled = true
+      clearTimeout(validationTimer)
+    }
+  }, [nextCardCode, showNextCardForm])
 
   const redirectToActiveCard = useCallback((activeCardValue: string, gameCode?: string | null) => {
     const activeCardSlug = getActiveCardSlug(activeCardValue)
@@ -295,6 +323,9 @@ export default function ResultPage() {
     setIsSlotRunning(false)
     setShowContinueSlider(false)
     setResultExiting(true)
+    setNextCardCode('')
+    setValidatedNextCardSlug(null)
+    setValidatingNextCard(false)
 
     const closeResultTimer = setTimeout(() => {
       setRoundFinished(true)
@@ -775,27 +806,18 @@ export default function ResultPage() {
   }
 
   async function handleGoToNextCardByCode() {
-    const nextCardSlug = createCardSlugFromCode(nextCardCode)
+    const requestedCardSlug = createCardSlugFromCode(nextCardCode)
+    const nextCardSlug = validatedNextCardSlug
 
-    if (!nextCardSlug || !currentGameId || openingNextCard) return
+    if (
+      !nextCardSlug ||
+      nextCardSlug !== requestedCardSlug ||
+      !currentGameId ||
+      openingNextCard
+    ) return
 
     setOpeningNextCard(true)
     setError(null)
-
-    try {
-      const exists = await cardExists(nextCardSlug)
-
-      if (!exists) {
-        setError('No existe esa carta')
-        setOpeningNextCard(false)
-        return
-      }
-    } catch (err) {
-      console.error('NEXT CARD VALIDATION ERROR', err)
-      setError('No se pudo comprobar la siguiente carta')
-      setOpeningNextCard(false)
-      return
-    }
 
     const sessionId = localStorage.getItem('session_id')
 
@@ -1274,7 +1296,7 @@ export default function ResultPage() {
                     Siguiente carta
                   </p>
                   <p className="mt-1 text-sm text-neutral-500">
-                    Escanea o introduce el número de la siguiente carta de EL GALLINERO.
+                    Escanea o introduce el número de la siguiente carta.
                   </p>
 
                   <div className="mt-4 flex items-center gap-2">
@@ -1285,9 +1307,18 @@ export default function ResultPage() {
                       type="text"
                       inputMode="numeric"
                       value={nextCardCode}
-                      onChange={(event) =>
-                        setNextCardCode(event.target.value.replace(/\D/g, '').slice(0, 3))
-                      }
+                      onChange={(event) => {
+                        const value = event.target.value
+                        if (/^\d{0,3}$/.test(value)) {
+                          setNextCardCode(value)
+                          setValidatedNextCardSlug(null)
+                          setValidatingNextCard(!!createCardSlugFromCode(value))
+                        }
+                      }}
+                      onBlur={() => {
+                        const normalizedSlug = createCardSlugFromCode(nextCardCode)
+                        if (normalizedSlug) setNextCardCode(normalizedSlug.slice(-3))
+                      }}
                       placeholder="001"
                       className="min-w-0 flex-1 rounded-2xl border border-neutral-300 px-4 py-3 outline-none focus:border-neutral-500"
                     />
@@ -1295,7 +1326,12 @@ export default function ResultPage() {
 
                   <button
                     onClick={handleGoToNextCardByCode}
-                    disabled={!nextCardCode.trim() || openingNextCard}
+                    disabled={
+                      validatingNextCard ||
+                      !validatedNextCardSlug ||
+                      validatedNextCardSlug !== createCardSlugFromCode(nextCardCode) ||
+                      openingNextCard
+                    }
                     className="mt-3 w-full rounded-2xl bg-black px-4 py-3 font-medium text-white transition hover:opacity-90 disabled:opacity-40"
                   >
                     {openingNextCard ? 'Abriendo carta...' : 'Votar'}

@@ -1,9 +1,9 @@
 import { supabase } from '@/lib/supabase'
 
 export function createCardSlugFromCode(code: string) {
-  const cleanCode = code.trim().replace(/\D/g, '')
+  const cleanCode = code.trim()
 
-  if (!cleanCode) return null
+  if (!/^\d{1,3}$/.test(cleanCode) || Number(cleanCode) === 0) return null
 
   return `carta-${cleanCode.padStart(3, '0')}`
 }
@@ -19,6 +19,7 @@ export async function cardExists(slug: string) {
     .from('cards')
     .select('id')
     .eq('slug', slug)
+    .eq('active', true)
     .maybeSingle()
 
   if (error) {
