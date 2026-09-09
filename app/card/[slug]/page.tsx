@@ -16,6 +16,7 @@ import {
   storeGameSession,
 } from '@/lib/session'
 import { usePlayerHeartbeat } from '@/lib/use-player-heartbeat'
+import { getVisibleCardCode } from '@/lib/cards'
 import Image from 'next/image'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
 
@@ -613,7 +614,13 @@ function CardContent() {
             <p className="text-lg font-semibold">{game?.code}</p>
           </div>
 
-          <h1 className="mt-6 text-2xl font-bold leading-tight">
+          {card ? (
+            <p className="mt-6 text-sm font-semibold text-neutral-500">
+              {getVisibleCardCode(card.slug)}
+            </p>
+          ) : null}
+
+          <h1 className="mt-2 text-2xl font-bold leading-tight">
             {card?.question_text}
           </h1>
 

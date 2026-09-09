@@ -1279,7 +1279,7 @@ export default function ResultPage() {
 
                   <div className="mt-4 flex items-center gap-2">
                     <div className="rounded-2xl bg-neutral-100 px-4 py-3 font-semibold text-neutral-600">
-                      Z-
+                      V-
                     </div>
                     <input
                       type="text"

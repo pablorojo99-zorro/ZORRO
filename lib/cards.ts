@@ -8,6 +8,12 @@ export function createCardSlugFromCode(code: string) {
   return `carta-${cleanCode.padStart(3, '0')}`
 }
 
+export function getVisibleCardCode(slug: string) {
+  const match = /^carta-(\d{3})$/.exec(slug)
+
+  return match ? `V-${match[1]}` : null
+}
+
 export async function cardExists(slug: string) {
   const { data, error } = await supabase
     .from('cards')
