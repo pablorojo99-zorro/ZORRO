@@ -55,6 +55,44 @@ type VoteRound = {
 type PendingVote = {
   roundId: string
   playerId: string
+  recoveryAttempts: number
+  allowAutomaticRetry: boolean
+}
+
+const VOTE_RECOVERY_DELAYS_MS = [1500, 3000, 6000, 12000, 20000, 30000]
+const VOTE_SUBMIT_TIMEOUT_MS = 12000
+
+async function submitVoteWithTimeout(
+  voteRoundId: string,
+  sessionId: string,
+  playerId: string,
+  controller: AbortController
+) {
+  const timeoutId = window.setTimeout(() => controller.abort(), VOTE_SUBMIT_TIMEOUT_MS)
+
+  try {
+    return await supabase
+      .rpc('submit_vote', {
+        p_vote_round_id: voteRoundId,
+        p_voter_session_id: sessionId,
+        p_voted_player_id: playerId,
+      })
+      .abortSignal(controller.signal)
+  } finally {
+    window.clearTimeout(timeoutId)
+  }
+}
+
+function getFunctionalVoteErrorMessage(error: unknown) {
+  const message = getErrorMessage(error).toLowerCase()
+
+  if (message.includes('voter_not_found')) return 'No se ha podido validar tu jugador.'
+  if (message.includes('target_not_found')) return 'El jugador seleccionado ya no está disponible.'
+  if (message.includes('self_vote_not_allowed')) return 'No puedes votarte a ti mismo.'
+  if (message.includes('target_not_in_tiebreak')) return 'Ese jugador no participa en el desempate.'
+  if (message.includes('vote_round_not_open')) return 'La ronda de votación ya ha terminado.'
+
+  return null
 }
 
 function hasTiebreakPlayers(round: VoteRound | null) {
@@ -107,7 +145,7 @@ function CardContent() {
   const [voteNotice, setVoteNotice] = useState('')
   const [pendingVote, setPendingVote] = useState<PendingVote | null>(null)
   const [voteOutcomeUnknown, setVoteOutcomeUnknown] = useState(false)
-  const [voteRetryAvailable, setVoteRetryAvailable] = useState(false)
+  const [voteRecoveryExhausted, setVoteRecoveryExhausted] = useState(false)
   const [selectedVotePlayerId, setSelectedVotePlayerId] = useState<string | null>(null)
   const [sessionRecoveryPending, setSessionRecoveryPending] = useState(false)
   const [needsGameCode, setNeedsGameCode] = useState(false)
@@ -125,6 +163,8 @@ function CardContent() {
   const voteOutcomeRequestIdRef = useRef(0)
   const cardLoadRequestIdRef = useRef(0)
   const pendingVoteRef = useRef<PendingVote | null>(null)
+  const voteRecoveryRunningRef = useRef(false)
+  const voteSubmitAbortControllerRef = useRef<AbortController | null>(null)
   const navigateRecoverably = useRecoverableNavigation(router)
   usePlayerHeartbeat(game?.id || null)
 
@@ -137,6 +177,8 @@ function CardContent() {
       voteStateRequestIdRef.current += 1
       voteOutcomeRequestIdRef.current += 1
       cardLoadRequestIdRef.current += 1
+      voteSubmitAbortControllerRef.current?.abort()
+      voteSubmitAbortControllerRef.current = null
     }
   }, [])
 
@@ -145,7 +187,7 @@ function CardContent() {
   }, [pendingVote])
 
   const reconcileActiveCard = useCallback(async () => {
-    if (!game || !voteRound) return false
+    if (!game || !voteRound) return null
 
     const requestId = ++activeCardRequestIdRef.current
 
@@ -155,20 +197,19 @@ function CardContent() {
       .eq('id', game.id)
       .single()
 
-    if (!mountedRef.current || requestId !== activeCardRequestIdRef.current) return false
+    if (!mountedRef.current || requestId !== activeCardRequestIdRef.current) return null
 
     if (gameError) {
       console.error('CARD ACTIVE STATE ERROR', gameError)
-      return false
+      return null
     }
 
     const activeCardSlug = getActiveCardSlug(currentGame.active_card_slug)
     const activeRoundId = getActiveCardRoundId(currentGame.active_card_slug)
 
-    if (
-      !activeCardSlug ||
-      (activeCardSlug === slug && (!activeRoundId || activeRoundId === voteRound.id))
-    ) {
+    if (!activeCardSlug) return null
+
+    if (activeCardSlug === slug && (!activeRoundId || activeRoundId === voteRound.id)) {
       return false
     }
 
@@ -330,7 +371,7 @@ function CardContent() {
           pendingVoteRef.current = null
           setPendingVote(null)
           setVoteOutcomeUnknown(false)
-          setVoteRetryAvailable(false)
+          setVoteRecoveryExhausted(false)
           setSelectedVotePlayerId(null)
           setVoteNotice('')
         }
@@ -429,15 +470,20 @@ function CardContent() {
   const verifyPendingVote = useCallback(async () => {
     const voteToVerify = pendingVoteRef.current
 
-    if (!voteToVerify || !sessionId) return
+    if (!voteToVerify || !sessionId || voteRecoveryRunningRef.current) return
 
-    if (await reconcileActiveCard()) return
-
-    if (pendingVoteRef.current?.roundId !== voteToVerify.roundId) return
-
-    const requestId = ++voteOutcomeRequestIdRef.current
+    voteRecoveryRunningRef.current = true
 
     try {
+      const activeCardResult = await reconcileActiveCard()
+
+      if (activeCardResult === true) return
+      if (activeCardResult === null) throw new Error('active_card_state_unavailable')
+
+      if (pendingVoteRef.current?.roundId !== voteToVerify.roundId) return
+
+      const requestId = ++voteOutcomeRequestIdRef.current
+
       const voteState = await getVoteState(voteToVerify.roundId, sessionId)
 
       if (
@@ -457,9 +503,9 @@ function CardContent() {
         setAlreadyVoted(true)
         setVoteSaved(true)
         setVoteOutcomeUnknown(false)
-        setVoteRetryAvailable(false)
+        setVoteRecoveryExhausted(false)
         setPendingVote(null)
-        setVoteNotice('Voto guardado')
+        setVoteNotice('¡Voto guardado!')
         setAllVoted(
           voteState.vote_count >= voteState.required_vote_count &&
             voteState.required_vote_count > 0
@@ -487,27 +533,124 @@ function CardContent() {
         pendingVoteRef.current = null
         setPendingVote(null)
         setVoteOutcomeUnknown(false)
-        setVoteRetryAvailable(false)
+        setVoteRecoveryExhausted(false)
         localStorage.setItem(`last_round_${slug}`, voteToVerify.roundId)
         router.push(`/result/${slug}?round=${voteToVerify.roundId}`)
         return
       }
 
-      pendingVoteRef.current = null
-      setPendingVote(null)
-      setVoteOutcomeUnknown(false)
-      setVoteRetryAvailable(true)
-      setVoteNotice('El voto no se guardó. Ya puedes intentarlo de nuevo.')
+      if (!voteToVerify.allowAutomaticRetry) {
+        pendingVoteRef.current = null
+        setPendingVote(null)
+        setVoteOutcomeUnknown(false)
+        setVoteRecoveryExhausted(false)
+        setVoteNotice('No se ha podido completar el voto.')
+        return
+      }
+
+      if (voteToVerify.recoveryAttempts >= VOTE_RECOVERY_DELAYS_MS.length) {
+        setVoteRecoveryExhausted(true)
+        setVoteNotice('No hemos podido completar tu voto. Comprueba tu conexión.')
+        return
+      }
+
+      setSubmittingVote(true)
+
+      let retryError: unknown = null
+      const retryController = new AbortController()
+      voteSubmitAbortControllerRef.current = retryController
+
+      try {
+        const { error } = await submitVoteWithTimeout(
+          voteToVerify.roundId,
+          sessionId,
+          voteToVerify.playerId,
+          retryController
+        )
+
+        retryError = error
+      } catch (unexpectedRetryError) {
+        retryError = unexpectedRetryError
+      } finally {
+        if (voteSubmitAbortControllerRef.current === retryController) {
+          voteSubmitAbortControllerRef.current = null
+        }
+      }
+
+      if (
+        !mountedRef.current ||
+        requestId !== voteOutcomeRequestIdRef.current ||
+        pendingVoteRef.current?.roundId !== voteToVerify.roundId
+      ) {
+        return
+      }
+
+      if (!retryError) {
+        pendingVoteRef.current = null
+        setPendingVote(null)
+        setAlreadyVoted(true)
+        setVoteSaved(true)
+        setVoteOutcomeUnknown(false)
+        setVoteRecoveryExhausted(false)
+        setVoteNotice('¡Voto guardado!')
+        return
+      }
+
+      const functionalMessage = getFunctionalVoteErrorMessage(retryError)
+
+      if (functionalMessage) {
+        if (getErrorMessage(retryError).toLowerCase().includes('vote_round_not_open')) {
+          const nextPendingVote = {
+            ...voteToVerify,
+            recoveryAttempts: voteToVerify.recoveryAttempts + 1,
+            allowAutomaticRetry: false,
+          }
+          pendingVoteRef.current = nextPendingVote
+          setPendingVote(nextPendingVote)
+          setVoteNotice('Recuperando conexión…')
+          return
+        }
+
+        pendingVoteRef.current = null
+        setPendingVote(null)
+        setVoteOutcomeUnknown(false)
+        setVoteRecoveryExhausted(false)
+        setVoteNotice(functionalMessage)
+        return
+      }
+
+      const nextPendingVote = {
+        ...voteToVerify,
+        recoveryAttempts: voteToVerify.recoveryAttempts + 1,
+      }
+      pendingVoteRef.current = nextPendingVote
+      setPendingVote(nextPendingVote)
+      setVoteNotice('Recuperando conexión…')
     } catch (voteVerificationError) {
       if (
         !mountedRef.current ||
-        requestId !== voteOutcomeRequestIdRef.current
+        pendingVoteRef.current?.roundId !== voteToVerify.roundId
       ) {
         return
       }
 
       console.error('VOTE OUTCOME VERIFICATION ERROR', voteVerificationError)
-      setVoteNotice('No hemos podido confirmar tu voto. Comprobando la conexión…')
+      const nextPendingVote = {
+        ...voteToVerify,
+        recoveryAttempts: voteToVerify.recoveryAttempts + 1,
+      }
+      pendingVoteRef.current = nextPendingVote
+      setPendingVote(nextPendingVote)
+
+      if (nextPendingVote.recoveryAttempts >= VOTE_RECOVERY_DELAYS_MS.length) {
+        setVoteRecoveryExhausted(true)
+        setVoteNotice('No hemos podido completar tu voto. Comprueba tu conexión.')
+      } else {
+        setVoteNotice('Recuperando conexión…')
+      }
+    } finally {
+      if (mountedRef.current) setSubmittingVote(false)
+      voteRecoveryRunningRef.current = false
     }
   }, [reconcileActiveCard, router, sessionId, slug])
 
@@ -519,10 +662,25 @@ function CardContent() {
   useEffect(() => {
     if (!pendingVote) return
 
-    requestVoteOutcomeReconciliation()
-    const retryId = window.setInterval(requestVoteOutcomeReconciliation, 5000)
+    if (pendingVote.recoveryAttempts === 0) {
+      requestVoteOutcomeReconciliation()
+      return
+    }
 
-    return () => window.clearInterval(retryId)
+    if (
+      pendingVote.recoveryAttempts >= VOTE_RECOVERY_DELAYS_MS.length ||
+      !navigator.onLine ||
+      document.visibilityState === 'hidden'
+    ) {
+      return
+    }
+
+    const retryId = window.setTimeout(
+      requestVoteOutcomeReconciliation,
+      VOTE_RECOVERY_DELAYS_MS[pendingVote.recoveryAttempts - 1]
+    )
+
+    return () => window.clearTimeout(retryId)
   }, [
     pendingVote,
     requestVoteOutcomeReconciliation,
@@ -583,8 +741,8 @@ function CardContent() {
         pendingVoteRef.current = null
         setPendingVote(null)
         setVoteOutcomeUnknown(false)
-        setVoteRetryAvailable(false)
-        setVoteNotice('Voto guardado')
+        setVoteRecoveryExhausted(false)
+        setVoteNotice('¡Voto guardado!')
       }
       setMissingVoters((currentMissingVoters) =>
         haveSameMissingVoters(currentMissingVoters, pendingVoters)
@@ -684,38 +842,63 @@ function CardContent() {
 
     setSubmittingVote(true)
     setSelectedVotePlayerId(playerId)
-    setVoteRetryAvailable(false)
+    setVoteRecoveryExhausted(false)
     setVoteNotice('')
 
     let submitError: unknown = null
+    const submitController = new AbortController()
+    voteSubmitAbortControllerRef.current = submitController
 
     try {
-      const { error } = await supabase.rpc('submit_vote', {
-        p_vote_round_id: voteRound.id,
-        p_voter_session_id: sessionId,
-        p_voted_player_id: playerId,
-      })
+      const { error } = await submitVoteWithTimeout(
+        voteRound.id,
+        sessionId,
+        playerId,
+        submitController
+      )
 
       submitError = error
     } catch (unexpectedSubmitError) {
       submitError = unexpectedSubmitError
+    } finally {
+      if (voteSubmitAbortControllerRef.current === submitController) {
+        voteSubmitAbortControllerRef.current = null
+      }
     }
+
+    if (!mountedRef.current) return
 
     if (submitError) {
       console.error('ERROR guardando voto', submitError)
-      const voteToVerify = { roundId: voteRound.id, playerId }
+      const functionalMessage = getFunctionalVoteErrorMessage(submitError)
+
+      if (
+        functionalMessage &&
+        !getErrorMessage(submitError).toLowerCase().includes('vote_round_not_open')
+      ) {
+        setVoteNotice(functionalMessage)
+        setSubmittingVote(false)
+        return
+      }
+
+      const voteToVerify = {
+        roundId: voteRound.id,
+        playerId,
+        recoveryAttempts: 0,
+        allowAutomaticRetry: !functionalMessage,
+      }
       pendingVoteRef.current = voteToVerify
       setPendingVote(voteToVerify)
       setVoteOutcomeUnknown(true)
-      setVoteNotice('No hemos podido confirmar tu voto. Comprobando la conexión…')
+      setVoteNotice('Recuperando conexión…')
       setSubmittingVote(false)
       return
     }
 
     setAlreadyVoted(true)
     setVoteSaved(true)
-    setVoteRetryAvailable(false)
-    setVoteNotice('Voto guardado')
+    setVoteRecoveryExhausted(false)
+    setVoteNotice('¡Voto guardado!')
 
     const requestId = ++voteStateRequestIdRef.current
     let voteState
@@ -1010,14 +1193,23 @@ function CardContent() {
             </p>
           ) : null}
 
-          {voteRetryAvailable && selectedVotePlayerId ? (
+          {voteRecoveryExhausted && pendingVote && selectedVotePlayerId ? (
             <button
               type="button"
-              onClick={() => handleVote(selectedVotePlayerId)}
-              disabled={submittingVote || voteOutcomeUnknown}
+              onClick={() => {
+                const nextPendingVote = {
+                  ...pendingVote,
+                  recoveryAttempts: 0,
+                }
+                pendingVoteRef.current = nextPendingVote
+                setPendingVote(nextPendingVote)
+                setVoteRecoveryExhausted(false)
+                setVoteNotice('Recuperando conexión…')
+              }}
+              disabled={submittingVote}
               className="mt-3 w-full rounded-2xl border border-neutral-300 px-4 py-3 font-medium text-neutral-900 transition hover:bg-neutral-50 disabled:opacity-50"
             >
-              Reintentar voto
+              Volver a comprobar
             </button>
           ) : null}
 
