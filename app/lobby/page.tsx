@@ -14,7 +14,7 @@ import {
   joinGameByCode,
   removePlayerFromGame,
 } from '@/lib/game-flow'
-import { getErrorMessage, getStoredSessionId } from '@/lib/session'
+import { getErrorMessage, getStoredSessionId, isMissingRowError } from '@/lib/session'
 import { usePlayerHeartbeat } from '@/lib/use-player-heartbeat'
 import { useRecoverableNavigation } from '@/lib/use-recoverable-navigation'
 import { useStateReconciliation } from '@/lib/use-state-reconciliation'
@@ -42,10 +42,13 @@ function LobbyContent() {
   const [openingCard, setOpeningCard] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [sessionRecoveryPending, setSessionRecoveryPending] = useState(false)
+  const [recoveryKey, setRecoveryKey] = useState(0)
   const [removingPlayerId, setRemovingPlayerId] = useState<string | null>(null)
   const mountedRef = useRef(true)
   const playersRequestIdRef = useRef(0)
   const activeCardRequestIdRef = useRef(0)
+  const lobbyLoadRequestIdRef = useRef(0)
   const navigateRecoverably = useRecoverableNavigation(router)
   usePlayerHeartbeat(gameId)
 
@@ -56,6 +59,7 @@ function LobbyContent() {
       mountedRef.current = false
       playersRequestIdRef.current += 1
       activeCardRequestIdRef.current += 1
+      lobbyLoadRequestIdRef.current += 1
     }
   }, [])
 
@@ -139,6 +143,24 @@ function LobbyContent() {
     reconcileLobby,
     !!gameId
   )
+
+  const reconcileSession = useCallback(() => {
+    setRecoveryKey((key) => key + 1)
+  }, [])
+
+  const requestSessionRecovery = useStateReconciliation(
+    reconcileSession,
+    sessionRecoveryPending
+  )
+
+  useEffect(() => {
+    if (!sessionRecoveryPending) return
+
+    requestSessionRecovery()
+    const retryId = window.setInterval(requestSessionRecovery, 5000)
+
+    return () => window.clearInterval(retryId)
+  }, [requestSessionRecovery, sessionRecoveryPending])
 
   async function handleGoToCardByCode() {
     const nextCardSlug = createCardSlugFromCode(cardCode)
@@ -233,6 +255,10 @@ function LobbyContent() {
 
   useEffect(() => {
     async function loadLobby() {
+      const requestId = ++lobbyLoadRequestIdRef.current
+      const isCurrent = () =>
+        mountedRef.current && requestId === lobbyLoadRequestIdRef.current
+
       if (!code) {
         setError('No hay código de partida')
         setLoading(false)
@@ -245,7 +271,17 @@ function LobbyContent() {
         .eq('code', code)
         .single()
 
-      if (gameError || !game) {
+      if (!isCurrent()) return
+
+      if (gameError && !isMissingRowError(gameError)) {
+        console.error('LOBBY GAME RECOVERY ERROR', gameError)
+        setSessionRecoveryPending(true)
+        setError('Recuperando tu partida…')
+        setLoading(false)
+        return
+      }
+
+      if (!game) {
         setError('No se encontró la partida')
         setLoading(false)
         return
@@ -255,27 +291,47 @@ function LobbyContent() {
 
       const sessionId = getStoredSessionId()
       if (sessionId) {
-        let player = await getPlayerBySession(sessionId, game.code).catch((playerError) => {
+        let player
+
+        try {
+          player = await getPlayerBySession(sessionId, game.code)
+        } catch (playerError) {
+          if (!isCurrent()) return
           console.error('LOBBY PLAYER SESSION ERROR', playerError)
-          return null
-        })
+          setSessionRecoveryPending(true)
+          setError('Recuperando tu partida…')
+          setLoading(false)
+          return
+        }
+
+        if (!isCurrent()) return
 
         if (!player) {
           const storedPlayerName = localStorage.getItem('player_name')
 
           if (storedPlayerName) {
-            player = await joinGameByCode(game.code, sessionId, storedPlayerName)
-              .then(() => getPlayerBySession(sessionId, game.code))
-              .catch((reconnectError) => {
-                console.error('LOBBY AUTO RECONNECT ERROR', reconnectError)
-                return null
-              })
+            try {
+              await joinGameByCode(game.code, sessionId, storedPlayerName)
+              player = await getPlayerBySession(sessionId, game.code)
+            } catch (reconnectError) {
+              if (!isCurrent()) return
+              console.error('LOBBY AUTO RECONNECT ERROR', reconnectError)
+              setSessionRecoveryPending(true)
+              setError('Recuperando tu partida…')
+              setLoading(false)
+              return
+            }
           }
         }
+
+        if (!isCurrent()) return
 
         setCurrentPlayerId(player?.player_id || null)
         setCurrentPlayerIsHost(!!player?.is_host)
       }
+
+      setSessionRecoveryPending(false)
+      setError('')
 
       if (game.active_card_slug) {
         redirectToActiveCard(game.active_card_slug, game.code)
@@ -283,11 +339,12 @@ function LobbyContent() {
       }
 
       await loadPlayers(game.id)
+      if (!isCurrent()) return
       setLoading(false)
     }
 
     loadLobby()
-  }, [code, loadPlayers, redirectToActiveCard])
+  }, [code, loadPlayers, recoveryKey, redirectToActiveCard])
 
   useEffect(() => {
     if (!gameId) return

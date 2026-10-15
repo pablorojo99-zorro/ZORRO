@@ -14,6 +14,8 @@ import {
 import {
   getErrorMessage,
   getOrCreateSessionId,
+  getSessionRecoveryErrorType,
+  isMissingRowError,
   storeGameSession,
 } from '@/lib/session'
 import { usePlayerHeartbeat } from '@/lib/use-player-heartbeat'
@@ -48,6 +50,11 @@ type VoteRound = {
   id: string
   status: string
   tie_player_ids: string[] | null
+}
+
+type PendingVote = {
+  roundId: string
+  playerId: string
 }
 
 function hasTiebreakPlayers(round: VoteRound | null) {
@@ -97,6 +104,12 @@ function CardContent() {
   const [allVoted, setAllVoted] = useState(false)
   const [submittingVote, setSubmittingVote] = useState(false)
   const [voteSaved, setVoteSaved] = useState(false)
+  const [voteNotice, setVoteNotice] = useState('')
+  const [pendingVote, setPendingVote] = useState<PendingVote | null>(null)
+  const [voteOutcomeUnknown, setVoteOutcomeUnknown] = useState(false)
+  const [voteRetryAvailable, setVoteRetryAvailable] = useState(false)
+  const [selectedVotePlayerId, setSelectedVotePlayerId] = useState<string | null>(null)
+  const [sessionRecoveryPending, setSessionRecoveryPending] = useState(false)
   const [needsGameCode, setNeedsGameCode] = useState(false)
   const [joinName, setJoinName] = useState('')
   const [joinCode, setJoinCode] = useState('')
@@ -109,6 +122,9 @@ function CardContent() {
   const mountedRef = useRef(true)
   const activeCardRequestIdRef = useRef(0)
   const voteStateRequestIdRef = useRef(0)
+  const voteOutcomeRequestIdRef = useRef(0)
+  const cardLoadRequestIdRef = useRef(0)
+  const pendingVoteRef = useRef<PendingVote | null>(null)
   const navigateRecoverably = useRecoverableNavigation(router)
   usePlayerHeartbeat(game?.id || null)
 
@@ -119,11 +135,17 @@ function CardContent() {
       mountedRef.current = false
       activeCardRequestIdRef.current += 1
       voteStateRequestIdRef.current += 1
+      voteOutcomeRequestIdRef.current += 1
+      cardLoadRequestIdRef.current += 1
     }
   }, [])
 
+  useEffect(() => {
+    pendingVoteRef.current = pendingVote
+  }, [pendingVote])
+
   const reconcileActiveCard = useCallback(async () => {
-    if (!game || !voteRound) return
+    if (!game || !voteRound) return false
 
     const requestId = ++activeCardRequestIdRef.current
 
@@ -133,11 +155,11 @@ function CardContent() {
       .eq('id', game.id)
       .single()
 
-    if (!mountedRef.current || requestId !== activeCardRequestIdRef.current) return
+    if (!mountedRef.current || requestId !== activeCardRequestIdRef.current) return false
 
     if (gameError) {
       console.error('CARD ACTIVE STATE ERROR', gameError)
-      return
+      return false
     }
 
     const activeCardSlug = getActiveCardSlug(currentGame.active_card_slug)
@@ -147,7 +169,7 @@ function CardContent() {
       !activeCardSlug ||
       (activeCardSlug === slug && (!activeRoundId || activeRoundId === voteRound.id))
     ) {
-      return
+      return false
     }
 
     const nextParams = new URLSearchParams({ auto: '1' })
@@ -156,10 +178,15 @@ function CardContent() {
     if (game.code) nextParams.set('code', game.code)
 
     navigateRecoverably(`/card/${activeCardSlug}?${nextParams.toString()}`)
+    return true
   }, [game, navigateRecoverably, slug, voteRound])
 
+  const reconcileActiveCardState = useCallback(async () => {
+    await reconcileActiveCard()
+  }, [reconcileActiveCard])
+
   const requestActiveCardReconciliation = useStateReconciliation(
-    reconcileActiveCard,
+    reconcileActiveCardState,
     !!game && !!voteRound
   )
 
@@ -170,6 +197,10 @@ function CardContent() {
 
   useEffect(() => {
     async function load() {
+      const requestId = ++cardLoadRequestIdRef.current
+      const isCurrent = () =>
+        mountedRef.current && requestId === cardLoadRequestIdRef.current
+
       try {
         const sId = localStorage.getItem('session_id')
 
@@ -182,30 +213,48 @@ function CardContent() {
         setSessionId(sId)
 
         const targetGameCode = codeFromQuery || localStorage.getItem('game_code')
-        let player = await getPlayerBySession(sId, targetGameCode).catch((playerError) => {
+        let player
+
+        try {
+          player = await getPlayerBySession(sId, targetGameCode)
+        } catch (playerError) {
+          if (!isCurrent()) return
           console.error('PLAYER ERROR', playerError)
-          return null
-        })
+          setSessionRecoveryPending(true)
+          setLoading(false)
+          return
+        }
+
+        if (!isCurrent()) return
 
         if (!player && targetGameCode) {
           const storedPlayerName = localStorage.getItem('player_name')
 
           if (storedPlayerName) {
-            player = await joinGameByCode(targetGameCode, sId, storedPlayerName)
-              .then(() => getPlayerBySession(sId, targetGameCode))
-              .catch((reconnectError) => {
-                console.error('CARD AUTO RECONNECT ERROR', reconnectError)
-                return null
-              })
+            try {
+              await joinGameByCode(targetGameCode, sId, storedPlayerName)
+              player = await getPlayerBySession(sId, targetGameCode)
+            } catch (reconnectError) {
+              if (!isCurrent()) return
+              console.error('CARD AUTO RECONNECT ERROR', reconnectError)
+              setSessionRecoveryPending(true)
+              setLoading(false)
+              return
+            }
           }
         }
 
+        if (!isCurrent()) return
+
         if (!player) {
+          setSessionRecoveryPending(false)
           setNeedsGameCode(true)
           setLoading(false)
           return
         }
 
+        setSessionRecoveryPending(false)
+        setNeedsGameCode(false)
         setCurrentPlayerId(player.player_id)
 
         if (targetGameCode) {
@@ -218,7 +267,16 @@ function CardContent() {
           .eq('id', player.game_id)
           .single()
 
-        if (gameError || !gameData) {
+        if (!isCurrent()) return
+
+        if (gameError && !isMissingRowError(gameError)) {
+          console.error('GAME RECOVERY ERROR', gameError)
+          setSessionRecoveryPending(true)
+          setLoading(false)
+          return
+        }
+
+        if (!gameData) {
           console.error('GAME ERROR', gameError)
           setError('No se encontró la partida.')
           setLoading(false)
@@ -231,7 +289,16 @@ function CardContent() {
           .eq('slug', slug)
           .single()
 
-        if (cardError || !cardData) {
+        if (!isCurrent()) return
+
+        if (cardError && !isMissingRowError(cardError)) {
+          console.error('CARD RECOVERY ERROR', cardError)
+          setSessionRecoveryPending(true)
+          setLoading(false)
+          return
+        }
+
+        if (!cardData) {
           console.error('CARD ERROR', cardError)
           setError('No se encontró esta carta.')
           setLoading(false)
@@ -253,6 +320,21 @@ function CardContent() {
           roundFromQuery
         )
 
+        if (!isCurrent()) return
+
+        if (
+          pendingVoteRef.current &&
+          pendingVoteRef.current.roundId !== roundData.id
+        ) {
+          voteOutcomeRequestIdRef.current += 1
+          pendingVoteRef.current = null
+          setPendingVote(null)
+          setVoteOutcomeUnknown(false)
+          setVoteRetryAvailable(false)
+          setSelectedVotePlayerId(null)
+          setVoteNotice('')
+        }
+
         if (roundData.status === 'closed') {
           localStorage.setItem(`last_round_${slug}`, roundData.id)
           router.push(`/result/${slug}?round=${roundData.id}`)
@@ -270,6 +352,8 @@ function CardContent() {
 
         const { data: playerList, error: playersError } = await playersQuery
 
+        if (!isCurrent()) return
+
         if (playersError || !playerList) {
           console.error('PLAYERS ERROR', playersError)
           setError('No se pudieron cargar los jugadores.')
@@ -277,16 +361,19 @@ function CardContent() {
           return
         }
 
-        const voteState = await getVoteState(roundData.id, sId).catch((voteStateError) => {
-          console.error('VOTE STATE ERROR', voteStateError)
-          return null
-        })
+        let voteState
 
-        if (!voteState) {
-          setError('No se pudo comprobar tu voto.')
+        try {
+          voteState = await getVoteState(roundData.id, sId)
+        } catch (voteStateError) {
+          if (!isCurrent()) return
+          console.error('VOTE STATE ERROR', voteStateError)
+          setSessionRecoveryPending(true)
           setLoading(false)
           return
         }
+
+        if (!isCurrent()) return
 
         setVoteCount(voteState.vote_count)
         setAllVoted(
@@ -304,7 +391,15 @@ function CardContent() {
         setMissingVoters(voteState.missing_players)
         setLoading(false)
       } catch (err) {
+        if (!isCurrent()) return
         console.error('LOAD ERROR', err)
+
+        if (getSessionRecoveryErrorType(err) === 'network') {
+          setSessionRecoveryPending(true)
+          setLoading(false)
+          return
+        }
+
         setError('Ha ocurrido un error cargando la carta.')
         setLoading(false)
       }
@@ -312,6 +407,126 @@ function CardContent() {
 
     load()
   }, [slug, roundFromQuery, cameFromAutoRedirect, codeFromQuery, loadKey, router])
+
+  const reconcileSession = useCallback(() => {
+    setLoadKey((key) => key + 1)
+  }, [])
+
+  const requestSessionRecovery = useStateReconciliation(
+    reconcileSession,
+    sessionRecoveryPending
+  )
+
+  useEffect(() => {
+    if (!sessionRecoveryPending) return
+
+    requestSessionRecovery()
+    const retryId = window.setInterval(requestSessionRecovery, 5000)
+
+    return () => window.clearInterval(retryId)
+  }, [requestSessionRecovery, sessionRecoveryPending])
+
+  const verifyPendingVote = useCallback(async () => {
+    const voteToVerify = pendingVoteRef.current
+
+    if (!voteToVerify || !sessionId) return
+
+    if (await reconcileActiveCard()) return
+
+    if (pendingVoteRef.current?.roundId !== voteToVerify.roundId) return
+
+    const requestId = ++voteOutcomeRequestIdRef.current
+
+    try {
+      const voteState = await getVoteState(voteToVerify.roundId, sessionId)
+
+      if (
+        !mountedRef.current ||
+        requestId !== voteOutcomeRequestIdRef.current ||
+        pendingVoteRef.current?.roundId !== voteToVerify.roundId
+      ) {
+        return
+      }
+
+      setVoteCount(voteState.vote_count)
+      setRequiredVoteCount(voteState.required_vote_count)
+      setMissingVoters(voteState.missing_players)
+
+      if (voteState.already_voted) {
+        pendingVoteRef.current = null
+        setAlreadyVoted(true)
+        setVoteSaved(true)
+        setVoteOutcomeUnknown(false)
+        setVoteRetryAvailable(false)
+        setPendingVote(null)
+        setVoteNotice('Voto guardado')
+        setAllVoted(
+          voteState.vote_count >= voteState.required_vote_count &&
+            voteState.required_vote_count > 0
+        )
+        return
+      }
+
+      const { data: currentRound, error: roundError } = await supabase
+        .from('vote_rounds')
+        .select('status')
+        .eq('id', voteToVerify.roundId)
+        .single()
+
+      if (
+        !mountedRef.current ||
+        requestId !== voteOutcomeRequestIdRef.current ||
+        pendingVoteRef.current?.roundId !== voteToVerify.roundId
+      ) {
+        return
+      }
+
+      if (roundError) throw roundError
+
+      if (currentRound.status !== 'voting') {
+        pendingVoteRef.current = null
+        setPendingVote(null)
+        setVoteOutcomeUnknown(false)
+        setVoteRetryAvailable(false)
+        localStorage.setItem(`last_round_${slug}`, voteToVerify.roundId)
+        router.push(`/result/${slug}?round=${voteToVerify.roundId}`)
+        return
+      }
+
+      pendingVoteRef.current = null
+      setPendingVote(null)
+      setVoteOutcomeUnknown(false)
+      setVoteRetryAvailable(true)
+      setVoteNotice('El voto no se guardó. Ya puedes intentarlo de nuevo.')
+    } catch (voteVerificationError) {
+      if (
+        !mountedRef.current ||
+        requestId !== voteOutcomeRequestIdRef.current
+      ) {
+        return
+      }
+
+      console.error('VOTE OUTCOME VERIFICATION ERROR', voteVerificationError)
+      setVoteNotice('No hemos podido confirmar tu voto. Comprobando la conexión…')
+    }
+  }, [reconcileActiveCard, router, sessionId, slug])
+
+  const requestVoteOutcomeReconciliation = useStateReconciliation(
+    verifyPendingVote,
+    !!pendingVote
+  )
+
+  useEffect(() => {
+    if (!pendingVote) return
+
+    requestVoteOutcomeReconciliation()
+    const retryId = window.setInterval(requestVoteOutcomeReconciliation, 5000)
+
+    return () => window.clearInterval(retryId)
+  }, [
+    pendingVote,
+    requestVoteOutcomeReconciliation,
+  ])
 
   useEffect(() => {
     if (allVoted || !voteRound || !game) return
@@ -361,6 +576,16 @@ function CardContent() {
       setRequiredVoteCount(nextRequiredVoteCount)
       setAlreadyVoted(voteState.already_voted)
       setVoteSaved(voteState.already_voted)
+      if (
+        voteState.already_voted &&
+        pendingVoteRef.current?.roundId === currentVoteRound.id
+      ) {
+        pendingVoteRef.current = null
+        setPendingVote(null)
+        setVoteOutcomeUnknown(false)
+        setVoteRetryAvailable(false)
+        setVoteNotice('Voto guardado')
+      }
       setMissingVoters((currentMissingVoters) =>
         haveSameMissingVoters(currentMissingVoters, pendingVoters)
           ? currentMissingVoters
@@ -447,22 +672,50 @@ function CardContent() {
   }, [allVoted, router, slug, voteRound])
 
   async function handleVote(playerId: string) {
-    if (!voteRound || !sessionId || alreadyVoted || submittingVote) return
+    if (
+      !voteRound ||
+      !sessionId ||
+      alreadyVoted ||
+      submittingVote ||
+      voteOutcomeUnknown
+    ) {
+      return
+    }
 
     setSubmittingVote(true)
+    setSelectedVotePlayerId(playerId)
+    setVoteRetryAvailable(false)
+    setVoteNotice('')
 
-    const { error } = await supabase.rpc('submit_vote', {
-      p_vote_round_id: voteRound.id,
-      p_voter_session_id: sessionId,
-      p_voted_player_id: playerId,
-    })
+    let submitError: unknown = null
 
-    if (error) {
-      console.error('ERROR guardando voto', error)
-      setError('No se pudo guardar tu voto.')
+    try {
+      const { error } = await supabase.rpc('submit_vote', {
+        p_vote_round_id: voteRound.id,
+        p_voter_session_id: sessionId,
+        p_voted_player_id: playerId,
+      })
+
+      submitError = error
+    } catch (unexpectedSubmitError) {
+      submitError = unexpectedSubmitError
+    }
+
+    if (submitError) {
+      console.error('ERROR guardando voto', submitError)
+      const voteToVerify = { roundId: voteRound.id, playerId }
+      pendingVoteRef.current = voteToVerify
+      setPendingVote(voteToVerify)
+      setVoteOutcomeUnknown(true)
+      setVoteNotice('No hemos podido confirmar tu voto. Comprobando la conexión…')
       setSubmittingVote(false)
       return
     }
+
+    setAlreadyVoted(true)
+    setVoteSaved(true)
+    setVoteRetryAvailable(false)
+    setVoteNotice('Voto guardado')
 
     const requestId = ++voteStateRequestIdRef.current
     let voteState
@@ -578,6 +831,10 @@ function CardContent() {
 
   if (loading) {
     return <p className="p-6">Cargando...</p>
+  }
+
+  if (sessionRecoveryPending && !card) {
+    return <p className="p-6">Recuperando tu partida...</p>
   }
 
   if (needsGameCode) {
@@ -741,6 +998,29 @@ function CardContent() {
             {card?.question_text}
           </h1>
 
+          {sessionRecoveryPending ? (
+            <p className="mt-4 text-sm font-medium text-neutral-600">
+              Recuperando tu partida…
+            </p>
+          ) : null}
+
+          {voteNotice ? (
+            <p className="mt-4 text-sm font-medium text-neutral-600">
+              {voteNotice}
+            </p>
+          ) : null}
+
+          {voteRetryAvailable && selectedVotePlayerId ? (
+            <button
+              type="button"
+              onClick={() => handleVote(selectedVotePlayerId)}
+              disabled={submittingVote || voteOutcomeUnknown}
+              className="mt-3 w-full rounded-2xl border border-neutral-300 px-4 py-3 font-medium text-neutral-900 transition hover:bg-neutral-50 disabled:opacity-50"
+            >
+              Reintentar voto
+            </button>
+          ) : null}
+
           {!alreadyVoted && (
             <div className="mt-6 space-y-3">
               {players
@@ -749,7 +1029,7 @@ function CardContent() {
                   <button
                     key={p.id}
                     onClick={() => handleVote(p.id)}
-                    disabled={submittingVote}
+                    disabled={submittingVote || voteOutcomeUnknown}
                     className="w-full rounded-2xl border border-neutral-200 px-4 py-4 text-left transition hover:bg-neutral-50 disabled:opacity-50"
                   >
                     {p.name}
