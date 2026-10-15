@@ -1,8 +1,9 @@
 'use client'
 
 import type { FormEvent } from 'react'
-import { Suspense, useEffect, useState } from 'react'
+import { Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { supabase } from '@/lib/supabase'
+import { getActiveCardRoundId, getActiveCardSlug } from '@/lib/active-card'
 import {
   activateGameCard,
   getOrCreateVoteRound,
@@ -16,6 +17,8 @@ import {
   storeGameSession,
 } from '@/lib/session'
 import { usePlayerHeartbeat } from '@/lib/use-player-heartbeat'
+import { useRecoverableNavigation } from '@/lib/use-recoverable-navigation'
+import { useStateReconciliation } from '@/lib/use-state-reconciliation'
 import { getVisibleCardCode } from '@/lib/cards'
 import Image from 'next/image'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
@@ -103,7 +106,67 @@ function CardContent() {
   const [loadKey, setLoadKey] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const mountedRef = useRef(true)
+  const activeCardRequestIdRef = useRef(0)
+  const voteStateRequestIdRef = useRef(0)
+  const navigateRecoverably = useRecoverableNavigation(router)
   usePlayerHeartbeat(game?.id || null)
+
+  useEffect(() => {
+    mountedRef.current = true
+
+    return () => {
+      mountedRef.current = false
+      activeCardRequestIdRef.current += 1
+      voteStateRequestIdRef.current += 1
+    }
+  }, [])
+
+  const reconcileActiveCard = useCallback(async () => {
+    if (!game || !voteRound) return
+
+    const requestId = ++activeCardRequestIdRef.current
+
+    const { data: currentGame, error: gameError } = await supabase
+      .from('public_games')
+      .select('active_card_slug')
+      .eq('id', game.id)
+      .single()
+
+    if (!mountedRef.current || requestId !== activeCardRequestIdRef.current) return
+
+    if (gameError) {
+      console.error('CARD ACTIVE STATE ERROR', gameError)
+      return
+    }
+
+    const activeCardSlug = getActiveCardSlug(currentGame.active_card_slug)
+    const activeRoundId = getActiveCardRoundId(currentGame.active_card_slug)
+
+    if (
+      !activeCardSlug ||
+      (activeCardSlug === slug && (!activeRoundId || activeRoundId === voteRound.id))
+    ) {
+      return
+    }
+
+    const nextParams = new URLSearchParams({ auto: '1' })
+
+    if (activeRoundId) nextParams.set('round', activeRoundId)
+    if (game.code) nextParams.set('code', game.code)
+
+    navigateRecoverably(`/card/${activeCardSlug}?${nextParams.toString()}`)
+  }, [game, navigateRecoverably, slug, voteRound])
+
+  const requestActiveCardReconciliation = useStateReconciliation(
+    reconcileActiveCard,
+    !!game && !!voteRound
+  )
+
+  useEffect(() => {
+    activeCardRequestIdRef.current += 1
+    voteStateRequestIdRef.current += 1
+  }, [game?.id, slug, voteRound?.id])
 
   useEffect(() => {
     async function load() {
@@ -260,7 +323,11 @@ function CardContent() {
     async function refreshVoteState() {
       if (!currentSessionId) return
 
+      const requestId = ++voteStateRequestIdRef.current
+
       const voteState = await getVoteState(currentVoteRound.id, currentSessionId)
+
+      if (!mountedRef.current || requestId !== voteStateRequestIdRef.current) return
 
       let playersQuery = supabase
         .from('public_players')
@@ -275,6 +342,8 @@ function CardContent() {
       }
 
       const { data: playerList, error: playersError } = await playersQuery
+
+      if (!mountedRef.current || requestId !== voteStateRequestIdRef.current) return
 
       if (playersError) {
         console.error('PLAYERS REFRESH ERROR', playersError)
@@ -303,8 +372,18 @@ function CardContent() {
       }
     }
 
-    refreshVoteState()
-    const refreshIntervalId = window.setInterval(refreshVoteState, 3000)
+    const safelyRefreshVoteState = () => {
+      void refreshVoteState().catch((refreshError) => {
+        console.error('VOTE STATE REFRESH ERROR', refreshError)
+      })
+    }
+
+    safelyRefreshVoteState()
+    const refreshIntervalId = window.setInterval(safelyRefreshVoteState, 3000)
+    const activeCardIntervalId = window.setInterval(
+      requestActiveCardReconciliation,
+      10000
+    )
 
     const channel = supabase
       .channel(`card:${currentVoteRound.id}`)
@@ -316,7 +395,7 @@ function CardContent() {
           table: 'realtime_events',
           filter: `vote_round_id=eq.${currentVoteRound.id}`,
         },
-        refreshVoteState
+        safelyRefreshVoteState
       )
       .on(
         'postgres_changes',
@@ -326,15 +405,39 @@ function CardContent() {
           table: 'realtime_events',
           filter: `game_id=eq.${currentGame.id}`,
         },
-        refreshVoteState
+        (payload) => {
+          const eventType = (payload.new as { event_type?: string }).event_type
+
+          if (eventType === 'game_changed') {
+            requestActiveCardReconciliation()
+          }
+        }
       )
-      .subscribe()
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          safelyRefreshVoteState()
+          requestActiveCardReconciliation()
+        } else if (
+          status === 'CHANNEL_ERROR' ||
+          status === 'TIMED_OUT' ||
+          status === 'CLOSED'
+        ) {
+          console.warn(`CARD REALTIME ${status}`)
+        }
+      })
 
     return () => {
       window.clearInterval(refreshIntervalId)
+      window.clearInterval(activeCardIntervalId)
       supabase.removeChannel(channel)
     }
-  }, [allVoted, game, sessionId, voteRound])
+  }, [
+    allVoted,
+    game,
+    requestActiveCardReconciliation,
+    sessionId,
+    voteRound,
+  ])
 
   useEffect(() => {
     if (!allVoted || !voteRound) return
@@ -361,7 +464,21 @@ function CardContent() {
       return
     }
 
-    const voteState = await getVoteState(voteRound.id, sessionId)
+    const requestId = ++voteStateRequestIdRef.current
+    let voteState
+
+    try {
+      voteState = await getVoteState(voteRound.id, sessionId)
+    } catch (voteStateError) {
+      console.error('VOTE STATE AFTER SUBMIT ERROR', voteStateError)
+      setSubmittingVote(false)
+      return
+    }
+
+    if (!mountedRef.current || requestId !== voteStateRequestIdRef.current) {
+      if (mountedRef.current) setSubmittingVote(false)
+      return
+    }
 
     setVoteCount(voteState.vote_count)
     setRequiredVoteCount(voteState.required_vote_count)

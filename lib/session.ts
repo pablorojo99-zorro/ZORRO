@@ -75,3 +75,28 @@ export function getErrorMessage(err: unknown) {
 
   return 'Error desconocido'
 }
+
+export function getSessionRecoveryErrorType(err: unknown): 'network' | 'server' {
+  const message = getErrorMessage(err).toLowerCase()
+
+  if (
+    err instanceof TypeError ||
+    message.includes('failed to fetch') ||
+    message.includes('load failed') ||
+    message.includes('network') ||
+    message.includes('fetch')
+  ) {
+    return 'network'
+  }
+
+  return 'server'
+}
+
+export function isMissingRowError(err: unknown) {
+  return (
+    !!err &&
+    typeof err === 'object' &&
+    'code' in err &&
+    (err as { code?: string }).code === 'PGRST116'
+  )
+}

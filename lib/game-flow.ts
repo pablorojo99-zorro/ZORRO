@@ -39,16 +39,16 @@ export type RoundResult = {
 export async function getPlayerBySession(
   sessionId: string,
   code?: string | null
-): Promise<PlayerSessionResult> {
+): Promise<PlayerSessionResult | null> {
   const { data, error } = await supabase
     .rpc('get_player_by_session', {
       p_session_id: sessionId,
       p_code: code || null,
     })
-    .single()
+    .maybeSingle()
 
   if (error) throw error
-  return data as PlayerSessionResult
+  return data as PlayerSessionResult | null
 }
 
 export async function heartbeatPlayer(sessionId: string, gameId?: string | null) {

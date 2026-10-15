@@ -16,6 +16,8 @@ import {
 } from '@/lib/game-flow'
 import { getErrorMessage, getStoredSessionId } from '@/lib/session'
 import { usePlayerHeartbeat } from '@/lib/use-player-heartbeat'
+import { useRecoverableNavigation } from '@/lib/use-recoverable-navigation'
+import { useStateReconciliation } from '@/lib/use-state-reconciliation'
 import Image from 'next/image'
 import { useRouter, useSearchParams } from 'next/navigation'
 
@@ -41,16 +43,27 @@ function LobbyContent() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [removingPlayerId, setRemovingPlayerId] = useState<string | null>(null)
-  const redirectingToCardRef = useRef(false)
+  const mountedRef = useRef(true)
+  const playersRequestIdRef = useRef(0)
+  const activeCardRequestIdRef = useRef(0)
+  const navigateRecoverably = useRecoverableNavigation(router)
   usePlayerHeartbeat(gameId)
+
+  useEffect(() => {
+    mountedRef.current = true
+
+    return () => {
+      mountedRef.current = false
+      playersRequestIdRef.current += 1
+      activeCardRequestIdRef.current += 1
+    }
+  }, [])
 
   const redirectToActiveCard = useCallback((activeCardValue: string, gameCode?: string | null) => {
     const activeCardSlug = getActiveCardSlug(activeCardValue)
     const activeCardRoundId = getActiveCardRoundId(activeCardValue)
 
-    if (!activeCardSlug || redirectingToCardRef.current) return
-
-    redirectingToCardRef.current = true
+    if (!activeCardSlug) return
 
     if (activeCardRoundId) {
       const nextParams = new URLSearchParams({ auto: '1', round: activeCardRoundId })
@@ -59,29 +72,30 @@ function LobbyContent() {
         nextParams.set('code', gameCode)
       }
 
-      router.replace(`/card/${activeCardSlug}?${nextParams.toString()}`)
+      navigateRecoverably(`/card/${activeCardSlug}?${nextParams.toString()}`)
       return
     }
 
-    setCardScanMessage(getCardScanMessage(activeCardValue))
+    const nextParams = new URLSearchParams({ auto: '1' })
 
-    setTimeout(() => {
-      const nextParams = new URLSearchParams({ auto: '1' })
+    if (gameCode) {
+      nextParams.set('code', gameCode)
+    }
 
-      if (gameCode) {
-        nextParams.set('code', gameCode)
-      }
-
-      router.replace(`/card/${activeCardSlug}?${nextParams.toString()}`)
-    }, 1200)
-  }, [router])
+    if (navigateRecoverably(`/card/${activeCardSlug}?${nextParams.toString()}`, 1200)) {
+      setCardScanMessage(getCardScanMessage(activeCardValue))
+    }
+  }, [navigateRecoverably])
 
   const loadPlayers = useCallback(async (currentGameId: string) => {
+    const requestId = ++playersRequestIdRef.current
     const { data: playerList, error: playersError } = await supabase
       .from('public_players')
       .select('id, name, is_host, presence_status')
       .eq('game_id', currentGameId)
       .order('created_at', { ascending: true })
+
+    if (!mountedRef.current || requestId !== playersRequestIdRef.current) return
 
     if (playersError) {
       console.error('ERROR cargando jugadores', playersError)
@@ -93,11 +107,14 @@ function LobbyContent() {
   }, [])
 
   const loadActiveCard = useCallback(async (currentGameId: string) => {
+    const requestId = ++activeCardRequestIdRef.current
     const { data: game, error: gameError } = await supabase
       .from('public_games')
       .select('active_card_slug')
       .eq('id', currentGameId)
       .single()
+
+    if (!mountedRef.current || requestId !== activeCardRequestIdRef.current) return
 
     if (gameError) {
       console.error('ERROR cargando carta activa', gameError)
@@ -108,6 +125,20 @@ function LobbyContent() {
       redirectToActiveCard(game.active_card_slug, code)
     }
   }, [code, redirectToActiveCard])
+
+  const reconcileLobby = useCallback(async () => {
+    if (!gameId) return
+
+    await Promise.all([
+      loadPlayers(gameId),
+      loadActiveCard(gameId),
+    ])
+  }, [gameId, loadActiveCard, loadPlayers])
+
+  const requestLobbyReconciliation = useStateReconciliation(
+    reconcileLobby,
+    !!gameId
+  )
 
   async function handleGoToCardByCode() {
     const nextCardSlug = createCardSlugFromCode(cardCode)
@@ -152,6 +183,11 @@ function LobbyContent() {
       try {
         await joinGameByCode(code, sessionId, storedPlayerName)
         const player = await getPlayerBySession(sessionId, code)
+
+        if (!player) {
+          throw new Error('player_not_found_after_reconnect')
+        }
+
         setCurrentPlayerId(player.player_id)
         setCurrentPlayerIsHost(player.is_host)
       } catch (err) {
@@ -256,6 +292,11 @@ function LobbyContent() {
   useEffect(() => {
     if (!gameId) return
 
+    const pollIntervalId = window.setInterval(
+      requestLobbyReconciliation,
+      10000
+    )
+
     const channel = supabase
       .channel(`lobby:${gameId}`)
       .on(
@@ -266,17 +307,33 @@ function LobbyContent() {
           table: 'realtime_events',
           filter: `game_id=eq.${gameId}`,
         },
-        () => {
-          loadPlayers(gameId)
-          loadActiveCard(gameId)
+        (payload) => {
+          const eventType = (payload.new as { event_type?: string }).event_type
+
+          if (eventType === 'players_changed') {
+            void loadPlayers(gameId)
+          } else if (eventType === 'game_changed') {
+            void loadActiveCard(gameId)
+          }
         }
       )
-      .subscribe()
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          requestLobbyReconciliation()
+        } else if (
+          status === 'CHANNEL_ERROR' ||
+          status === 'TIMED_OUT' ||
+          status === 'CLOSED'
+        ) {
+          console.warn(`LOBBY REALTIME ${status}`)
+        }
+      })
 
     return () => {
+      window.clearInterval(pollIntervalId)
       supabase.removeChannel(channel)
     }
-  }, [gameId, loadActiveCard, loadPlayers, redirectToActiveCard])
+  }, [gameId, loadActiveCard, loadPlayers, requestLobbyReconciliation])
 
   return (
     <main className="min-h-screen bg-neutral-100 text-neutral-900">

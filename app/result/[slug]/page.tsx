@@ -24,9 +24,13 @@ import {
 import {
   getErrorMessage,
   getOrCreateSessionId,
+  getSessionRecoveryErrorType,
+  isMissingRowError,
   storeGameSession,
 } from '@/lib/session'
 import { usePlayerHeartbeat } from '@/lib/use-player-heartbeat'
+import { useRecoverableNavigation } from '@/lib/use-recoverable-navigation'
+import { useStateReconciliation } from '@/lib/use-state-reconciliation'
 import Image from 'next/image'
 import { useParams, useRouter } from 'next/navigation'
 
@@ -198,10 +202,38 @@ export default function ResultPage() {
   const [loadKey, setLoadKey] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const redirectingToCardRef = useRef(false)
+  const [temporarySessionError, setTemporarySessionError] = useState(false)
+  const mountedRef = useRef(true)
+  const resultLoadRunningRef = useRef(false)
+  const resultLoadQueuedRef = useRef(false)
+  const resultLoadScheduledRef = useRef(false)
+  const activeCardRequestIdRef = useRef(0)
+  const finalRoundIdRef = useRef<string | null>(null)
   const slotTimersRef = useRef<ReturnType<typeof setTimeout>[]>([])
   const displayedResultKeyRef = useRef<string | null>(null)
+  const navigateRecoverably = useRecoverableNavigation(router)
   usePlayerHeartbeat(currentGameId)
+
+  const scheduleResultLoad = useCallback(() => {
+    if (resultLoadRunningRef.current || resultLoadScheduledRef.current) {
+      resultLoadQueuedRef.current = true
+      return
+    }
+
+    resultLoadScheduledRef.current = true
+    setLoadKey((key) => key + 1)
+  }, [])
+
+  useEffect(() => {
+    mountedRef.current = true
+
+    return () => {
+      mountedRef.current = false
+      activeCardRequestIdRef.current += 1
+      resultLoadQueuedRef.current = false
+      resultLoadScheduledRef.current = false
+    }
+  }, [])
 
   useEffect(() => {
     const candidateSlug = createCardSlugFromCode(nextCardCode)
@@ -236,13 +268,10 @@ export default function ResultPage() {
     if (
       !activeCardSlug ||
       (activeCardSlug === slug && !activeCardRoundId) ||
-      activeCardRoundId === finalRoundId ||
-      redirectingToCardRef.current
+      activeCardRoundId === finalRoundIdRef.current
     ) {
       return
     }
-
-    redirectingToCardRef.current = true
 
     if (activeCardRoundId) {
       const nextParams = new URLSearchParams({
@@ -254,22 +283,68 @@ export default function ResultPage() {
         nextParams.set('code', gameCode)
       }
 
-      router.replace(`/card/${activeCardSlug}?${nextParams.toString()}`)
+      navigateRecoverably(`/card/${activeCardSlug}?${nextParams.toString()}`)
       return
     }
 
-    setCardScanMessage(getCardScanMessage(activeCardValue))
+    const nextParams = new URLSearchParams({ auto: '1' })
 
-    setTimeout(() => {
-      const nextParams = new URLSearchParams({ auto: '1' })
+    if (gameCode) {
+      nextParams.set('code', gameCode)
+    }
 
-      if (gameCode) {
-        nextParams.set('code', gameCode)
-      }
+    if (navigateRecoverably(`/card/${activeCardSlug}?${nextParams.toString()}`, 1200)) {
+      setCardScanMessage(getCardScanMessage(activeCardValue))
+    }
+  }, [navigateRecoverably, slug])
 
-      router.replace(`/card/${activeCardSlug}?${nextParams.toString()}`)
-    }, 1200)
-  }, [finalRoundId, router, slug])
+  const checkActiveCard = useCallback(async () => {
+    if (!currentGameId) return
+
+    const requestId = ++activeCardRequestIdRef.current
+    const { data: game, error: gameError } = await supabase
+      .from('public_games')
+      .select('active_card_slug')
+      .eq('id', currentGameId)
+      .single()
+
+    if (!mountedRef.current || requestId !== activeCardRequestIdRef.current) return
+
+    if (gameError) {
+      console.error('RESULT ACTIVE CARD REFRESH ERROR', gameError)
+      return
+    }
+
+    if (game?.active_card_slug) {
+      redirectToActiveCard(game.active_card_slug, currentGameCode)
+    }
+  }, [currentGameCode, currentGameId, redirectToActiveCard])
+
+  const reconcileResultState = useCallback(async () => {
+    if (temporarySessionError) {
+      scheduleResultLoad()
+      return
+    }
+
+    if (roundFinished && currentGameId) {
+      await checkActiveCard()
+      return
+    }
+
+    scheduleResultLoad()
+  }, [
+    checkActiveCard,
+    currentGameId,
+    roundFinished,
+    scheduleResultLoad,
+    temporarySessionError,
+  ])
+
+  const requestResultReconciliation = useStateReconciliation(reconcileResultState)
+
+  useEffect(() => {
+    activeCardRequestIdRef.current += 1
+  }, [currentGameId, slug])
 
   useEffect(() => {
     const existingStyle = document.getElementById('result-animation-style')
@@ -337,6 +412,16 @@ export default function ResultPage() {
   }, [])
 
   useEffect(() => {
+    if (resultLoadRunningRef.current) {
+      resultLoadQueuedRef.current = true
+      return
+    }
+
+    resultLoadScheduledRef.current = false
+    resultLoadRunningRef.current = true
+    let cancelled = false
+    const isCurrent = () => !cancelled && mountedRef.current
+
     async function loadResults() {
       try {
         const sessionId = localStorage.getItem('session_id')
@@ -350,16 +435,37 @@ export default function ResultPage() {
         }
 
         const storedGameCode = localStorage.getItem('game_code')
-        const currentPlayer = await getPlayerBySession(sessionId, storedGameCode).catch((playerError) => {
+        let currentPlayer
+
+        try {
+          currentPlayer = await getPlayerBySession(sessionId, storedGameCode)
+        } catch (playerError) {
+          if (!isCurrent()) return
+
           console.error('RESULT PLAYER ERROR', playerError)
-          return null
-        })
+
+          const recoveryErrorType = getSessionRecoveryErrorType(playerError)
+          setTemporarySessionError(true)
+          setError(
+            recoveryErrorType === 'network'
+              ? 'Se ha interrumpido la conexión. Recuperando tu partida...'
+              : 'No se pudo comprobar tu sesión. Reintentando...'
+          )
+          setLoading(false)
+          return
+        }
+
+        if (!isCurrent()) return
 
         if (!currentPlayer) {
+          setTemporarySessionError(false)
           setNeedsGameCode(true)
           setLoading(false)
           return
         }
+
+        setTemporarySessionError(false)
+        setError(null)
 
         setCurrentGameId(currentPlayer.game_id)
         const { data: gameData, error: gameError } = await supabase
@@ -368,8 +474,17 @@ export default function ResultPage() {
           .eq('id', currentPlayer.game_id)
           .single()
 
-        if (gameError || !gameData) {
+        if (!isCurrent()) return
+
+        if (gameError && !isMissingRowError(gameError)) {
+          throw gameError
+        }
+
+        if (!gameData) {
           console.error('RESULT GAME ERROR', gameError)
+          setError('No se encontró la partida')
+          setLoading(false)
+          return
         } else {
           setCurrentGameCode(gameData.code)
 
@@ -395,8 +510,11 @@ export default function ResultPage() {
             try {
               await clearActiveCardIfCurrent(gameData.id, sessionId, slug)
             } catch (clearActiveCardError) {
+              if (!isCurrent()) return
               console.error('RESULT CLEAR ACTIVE CARD ERROR', clearActiveCardError)
             }
+
+            if (!isCurrent()) return
           }
         }
 
@@ -406,7 +524,13 @@ export default function ResultPage() {
           .eq('slug', slug)
           .single()
 
-        if (cardError || !card) {
+        if (!isCurrent()) return
+
+        if (cardError && !isMissingRowError(cardError)) {
+          throw cardError
+        }
+
+        if (!card) {
           console.error('RESULT CARD ERROR', cardError)
           setError('No se encontró la carta')
           setLoading(false)
@@ -425,7 +549,13 @@ export default function ResultPage() {
             .limit(1)
             .maybeSingle()
 
-          if (fallbackRoundError || !fallbackRound) {
+          if (!isCurrent()) return
+
+          if (fallbackRoundError) {
+            throw fallbackRoundError
+          }
+
+          if (!fallbackRound) {
             console.error('RESULT ROUND FALLBACK ERROR', fallbackRoundError)
             setError('No se encontró la ronda de votación')
             setLoading(false)
@@ -443,6 +573,7 @@ export default function ResultPage() {
 
         const resultRoundId = resolvedRoundId
 
+        finalRoundIdRef.current = resultRoundId
         setFinalRoundId(resultRoundId)
 
         const { data: resultRound, error: resultRoundError } = await supabase
@@ -453,7 +584,13 @@ export default function ResultPage() {
           .eq('card_id', card.id)
           .single()
 
-        if (resultRoundError || !resultRound) {
+        if (!isCurrent()) return
+
+        if (resultRoundError && !isMissingRowError(resultRoundError)) {
+          throw resultRoundError
+        }
+
+        if (!resultRound) {
           console.error('RESULT ROUND ERROR', resultRoundError)
           setError('No se encontró la ronda de votación')
           setLoading(false)
@@ -488,7 +625,13 @@ export default function ResultPage() {
             .eq('id', resultRound.tie_player_ids[0])
             .single()
 
-          if (resolvedWinnerError || !resolvedWinner) {
+          if (!isCurrent()) return
+
+          if (resolvedWinnerError && !isMissingRowError(resolvedWinnerError)) {
+            throw resolvedWinnerError
+          }
+
+          if (!resolvedWinner) {
             console.error('RANDOM TIEBREAK WINNER ERROR', resolvedWinnerError)
             setError('No se pudo cargar el desempate aleatorio')
             setLoading(false)
@@ -516,6 +659,8 @@ export default function ResultPage() {
         }
 
         const roundResult = await getRoundResult(resultRoundId, sessionId)
+
+        if (!isCurrent()) return
         const requiredVoteCount = roundResult.required_vote_count
         const uniqueVoterCount = roundResult.vote_count
         const roundIsClosed = resultRound.status === 'closed'
@@ -592,20 +737,47 @@ export default function ResultPage() {
           try {
             await closeVoteRoundIfComplete(resultRoundId, sessionId)
           } catch (closeRoundError) {
+            if (!isCurrent()) return
             console.error('RESULT CLOSE ROUND ERROR', closeRoundError)
           }
         }
 
+        if (!isCurrent()) return
         setLoading(false)
       } catch (err) {
+        if (!isCurrent()) return
         console.error('RESULT LOAD ERROR', err)
-        setError('Error cargando resultado')
+        setTemporarySessionError(true)
+        setError('No se pudo actualizar el resultado. Reintentando...')
         setLoading(false)
       }
     }
 
-    loadResults()
+    void loadResults().finally(() => {
+      resultLoadRunningRef.current = false
+
+      if (!mountedRef.current || !resultLoadQueuedRef.current) return
+
+      resultLoadQueuedRef.current = false
+      resultLoadScheduledRef.current = true
+      setLoadKey((key) => key + 1)
+    })
+
+    return () => {
+      cancelled = true
+    }
   }, [slug, resetSlotAnimation, showNextCardPreparation, redirectToActiveCard, loadKey])
+
+  useEffect(() => {
+    if (!temporarySessionError) return
+
+    const retryIntervalId = window.setInterval(
+      requestResultReconciliation,
+      5000
+    )
+
+    return () => window.clearInterval(retryIntervalId)
+  }, [requestResultReconciliation, temporarySessionError])
 
   useEffect(() => {
     if (!currentGameId) return
@@ -620,36 +792,41 @@ export default function ResultPage() {
           table: 'realtime_events',
           filter: `game_id=eq.${currentGameId}`,
         },
-        async () => {
-          const { data: game, error: gameError } = await supabase
-            .from('public_games')
-            .select('active_card_slug')
-            .eq('id', currentGameId)
-            .single()
+        (payload) => {
+          const eventType = (payload.new as { event_type?: string }).event_type
 
-          if (gameError) {
-            console.error('RESULT ACTIVE CARD REFRESH ERROR', gameError)
-            return
-          }
-
-          if (game?.active_card_slug) {
-            redirectToActiveCard(game.active_card_slug, currentGameCode)
+          if (eventType === 'game_changed') {
+            requestResultReconciliation()
           }
         }
       )
-      .subscribe()
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          requestResultReconciliation()
+        } else if (
+          status === 'CHANNEL_ERROR' ||
+          status === 'TIMED_OUT' ||
+          status === 'CLOSED'
+        ) {
+          console.warn(`RESULT GAME REALTIME ${status}`)
+        }
+      })
 
     return () => {
       supabase.removeChannel(channel)
     }
-  }, [currentGameCode, currentGameId, redirectToActiveCard])
+  }, [
+    currentGameId,
+    requestResultReconciliation,
+  ])
 
   useEffect(() => {
     if (!finalRoundId || roundFinished) return
 
-    const refreshIntervalId = window.setInterval(() => {
-      setLoadKey((key) => key + 1)
-    }, 3000)
+    const refreshIntervalId = window.setInterval(
+      requestResultReconciliation,
+      3000
+    )
 
     const channel = supabase
       .channel(`result-round:${finalRoundId}`)
@@ -661,17 +838,41 @@ export default function ResultPage() {
           table: 'realtime_events',
           filter: `vote_round_id=eq.${finalRoundId}`,
         },
-        () => {
-          setLoadKey((key) => key + 1)
-        }
+        requestResultReconciliation
       )
-      .subscribe()
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          requestResultReconciliation()
+        } else if (
+          status === 'CHANNEL_ERROR' ||
+          status === 'TIMED_OUT' ||
+          status === 'CLOSED'
+        ) {
+          console.warn(`RESULT ROUND REALTIME ${status}`)
+        }
+      })
 
     return () => {
       window.clearInterval(refreshIntervalId)
       supabase.removeChannel(channel)
     }
-  }, [finalRoundId, roundFinished, showNextCardPreparation])
+  }, [
+    finalRoundId,
+    requestResultReconciliation,
+    roundFinished,
+    showNextCardPreparation,
+  ])
+
+  useEffect(() => {
+    if (!roundFinished || !currentGameId) return
+
+    const activeCardPollId = window.setInterval(
+      requestResultReconciliation,
+      8000
+    )
+
+    return () => window.clearInterval(activeCardPollId)
+  }, [currentGameId, requestResultReconciliation, roundFinished])
 
   useEffect(() => {
     if (!finalRoundId || roundFinished) return
