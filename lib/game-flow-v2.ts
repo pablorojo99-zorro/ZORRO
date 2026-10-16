@@ -28,6 +28,10 @@ export type CanonicalGameStateV2 = {
   tie_player_ids: string[] | null
   winning_player_id: string | null
   winning_votes: number | null
+  vote_count: number
+  required_vote_count: number
+  already_voted: boolean
+  missing_players: { id: string; name: string }[]
 }
 
 export type MutationEnvelopeV2 = {

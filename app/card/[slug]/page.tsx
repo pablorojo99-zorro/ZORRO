@@ -25,6 +25,12 @@ import { useV2CanonicalState } from '@/lib/use-v2-canonical-state'
 type Card = { id: string; slug: string; question_text: string }
 type Player = { id: string; name: string }
 
+function formatPlayerNames(players: Player[]) {
+  const names = players.map((player) => player.name)
+  if (names.length < 2) return names.join('')
+  return `${names.slice(0, -1).join(', ')} y ${names.at(-1)}`
+}
+
 function CardContent() {
   const router = useRouter()
   const slug = useParams<{ slug: string }>().slug
@@ -34,7 +40,6 @@ function CardContent() {
   const [gameCode, setGameCode] = useState('')
   const [card, setCard] = useState<Card | null>(null)
   const [players, setPlayers] = useState<Player[]>([])
-  const [alreadyVoted, setAlreadyVoted] = useState(false)
   const [busy, setBusy] = useState(false)
   const [loading, setLoading] = useState(true)
   const [message, setMessage] = useState('')
@@ -118,7 +123,6 @@ function CardContent() {
       if (canonicalRoundId) {
         const refreshId = window.setTimeout(() => {
           setMessage('')
-          setAlreadyVoted(localStorage.getItem(`v2_voted:${player.game_id}:${canonicalRoundId}`) === 'true')
           void loadPlayers(player.game_id).catch((error) => setMessage(getErrorMessage(error)))
         }, 0)
         return () => window.clearTimeout(refreshId)
@@ -195,7 +199,7 @@ function CardContent() {
   }
 
   async function handleVote(targetPlayerId: string) {
-    if (!state?.current_vote_round_id || !sessionId || !player || busy || alreadyVoted) return
+    if (!state?.current_vote_round_id || !sessionId || !player || busy || state.already_voted) return
     setBusy(true)
     setMessage('')
     const action = `vote:${state.current_vote_round_id}`
@@ -204,8 +208,6 @@ function CardContent() {
     try {
       await retryUncertainV2Mutation(() => submitVoteV2(state.current_vote_round_id!, sessionId, targetPlayerId, operationId, state.transition_version))
       clearOperationId(player.game_id, action)
-      localStorage.setItem(`v2_voted:${player.game_id}:${state.current_vote_round_id}`, 'true')
-      setAlreadyVoted(true)
       setMessage('¡Voto guardado!')
       await loadPlayers(player.game_id)
       await attemptClose()
@@ -216,8 +218,6 @@ function CardContent() {
         : ''
       if (errorCode === '23505') {
         clearOperationId(player.game_id, action)
-        localStorage.setItem(`v2_voted:${player.game_id}:${state.current_vote_round_id}`, 'true')
-        setAlreadyVoted(true)
         setMessage('Tu voto ya estaba guardado. Esperando al resto…')
         await attemptClose()
         await reconcile()
@@ -232,6 +232,7 @@ function CardContent() {
   }
 
   const candidates = players.filter((candidate) => candidate.id !== player?.player_id && (!state?.tie_player_ids?.length || state.tie_player_ids.includes(candidate.id)))
+  const alreadyVoted = state?.already_voted ?? false
   const effectiveMessage = canonicalError ? `Recuperando estado: ${getErrorMessage(canonicalError)}` : message
   return (
     <main className="min-h-screen bg-neutral-100 text-neutral-900"><div className="mx-auto max-w-md px-6 py-10"><div className="relative rounded-3xl bg-white p-6 shadow-sm ring-1 ring-black/5">
@@ -240,7 +241,7 @@ function CardContent() {
       <h1 className="mt-2 pr-12 text-2xl font-bold">{card?.question_text || 'Votación'}</h1>
       {state?.source_round_id ? <p className="mt-3 rounded-2xl bg-amber-100 px-4 py-3 text-sm font-medium">Ronda de desempate</p> : null}
       {loading ? <p className="mt-6">Cargando votación…</p> : null}
-      {!loading && state?.status === 'voting' ? <><div className="mt-6 space-y-3">{candidates.map((candidate) => <button key={candidate.id} disabled={busy || alreadyVoted} onClick={() => void handleVote(candidate.id)} className="w-full rounded-2xl border border-neutral-300 px-4 py-3 text-left font-medium transition hover:bg-neutral-50 disabled:opacity-40">{candidate.name}</button>)}</div>{alreadyVoted ? <p className="mt-5 rounded-2xl bg-green-50 px-4 py-3 text-sm font-medium text-green-800">Tu voto está guardado. Esperando al resto…</p> : null}</> : null}
+      {!loading && state?.status === 'voting' ? <><div className="mt-6 space-y-3">{candidates.map((candidate) => <button key={candidate.id} disabled={busy || alreadyVoted} onClick={() => void handleVote(candidate.id)} className="w-full rounded-2xl border border-neutral-300 px-4 py-3 text-left font-medium transition hover:bg-neutral-50 disabled:opacity-40">{candidate.name}</button>)}</div>{alreadyVoted ? <div className="mt-5 rounded-2xl bg-green-50 px-4 py-3 text-center text-sm font-medium text-green-800"><p>Tu voto está guardado. Esperando al resto…</p><p className="mt-2 text-lg font-bold tabular-nums">Votos: {state.vote_count}/{state.required_vote_count}</p>{state.missing_players.length > 0 ? <p className="mt-2 font-normal text-neutral-600">{state.missing_players.length === 1 ? 'Falta' : 'Faltan'} {formatPlayerNames(state.missing_players)} por votar</p> : null}</div> : null}</> : null}
       {effectiveMessage ? <p className="mt-4 text-sm font-medium text-red-600">{effectiveMessage}</p> : null}
     </div></div></main>
   )
