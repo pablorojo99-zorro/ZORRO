@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import { createGameWithHost, joinGameByCode } from '@/lib/game-flow'
+import { createGameWithHostV2, joinGameByCodeV2 } from '@/lib/game-flow-v2'
 import { getErrorMessage, getOrCreateSessionId, storeGameSession } from '@/lib/session'
 import Image from 'next/image'
 import { useRouter } from 'next/navigation'
@@ -54,7 +54,7 @@ export default function HomePage() {
         code = generateCode()
 
         try {
-          const createdGame = await createGameWithHost(code, sessionId, name.trim())
+          const createdGame = await createGameWithHostV2(code, sessionId, name.trim())
           game = createdGame
           break
         } catch (gameError) {
@@ -101,7 +101,7 @@ export default function HomePage() {
       const cleanCode = joinCode.trim().toUpperCase()
       const sessionId = getOrCreateSessionId()
 
-      const game = await joinGameByCode(cleanCode, sessionId, name.trim())
+      const game = await joinGameByCodeV2(cleanCode, sessionId, name.trim())
 
       storeGameSession(sessionId, game.code, name.trim())
 

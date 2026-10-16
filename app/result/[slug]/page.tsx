@@ -1,62 +1,36 @@
-
 'use client'
 
-import type { FormEvent, PointerEvent } from 'react'
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { supabase } from '@/lib/supabase'
-import {
-  getActiveCardRoundId,
-  getActiveCardSlug,
-  getCardScanMessage,
-} from '@/lib/active-card'
+import type { PointerEvent } from 'react'
+import { Suspense, useEffect, useRef, useState } from 'react'
+import Image from 'next/image'
+import { useParams, useRouter, useSearchParams } from 'next/navigation'
 import { cardExists, createCardSlugFromCode } from '@/lib/cards'
 import {
-  activateGameCard,
-  clearActiveCardIfCurrent,
-  closeVoteRoundIfComplete,
-  getPlayerBySession,
-  getRoundResult,
-  joinGameByCode,
-  markRoundReadyNext,
-  resolveRandomTiebreak,
-  startTiebreakRound,
-} from '@/lib/game-flow'
-import {
-  getErrorMessage,
-  getOrCreateSessionId,
-  getSessionRecoveryErrorType,
-  isMissingRowError,
-  storeGameSession,
-} from '@/lib/session'
-import { usePlayerHeartbeat } from '@/lib/use-player-heartbeat'
-import { useRecoverableNavigation } from '@/lib/use-recoverable-navigation'
-import { useStateReconciliation } from '@/lib/use-state-reconciliation'
-import Image from 'next/image'
-import { useParams, useRouter } from 'next/navigation'
+  activateGameCardV2,
+  clearOperationId,
+  getOrCreateOperationId,
+  getPlayerBySessionV2,
+  isStaleTransitionError,
+  joinGameByCodeV2,
+  markRoundReadyNextV2,
+  resolveRandomTiebreakV2,
+  retryUncertainV2Mutation,
+  startTiebreakRoundV2,
+  type PlayerSessionResultV2,
+} from '@/lib/game-flow-v2'
+import { getErrorMessage, getStoredSessionId } from '@/lib/session'
+import { supabase } from '@/lib/supabase'
+import { usePlayerHeartbeatV2 } from '@/lib/use-player-heartbeat-v2'
+import { useV2CanonicalState } from '@/lib/use-v2-canonical-state'
 
-type Player = {
-  id: string
-  name: string
-}
-
-type Game = {
-  id: string
-  code: string
-}
+type Player = { id: string; name: string }
 
 const RESULT_INTRO_TEXT = 'El jugador más votado es...'
-
-type JoinPlayer = {
-  id: string
-  name: string
-}
 
 function getCardTypeFromRound(roundId: string) {
   let total = 0
 
-  for (const char of roundId) {
-    total += char.charCodeAt(0)
-  }
+  for (const char of roundId) total += char.charCodeAt(0)
 
   return total % 2 === 0 ? 'RETO' : 'CONFESIÓN'
 }
@@ -78,36 +52,28 @@ function ContinueSlider({ onComplete }: { onComplete: () => void }) {
   function updateProgress(clientX: number) {
     const track = trackRef.current
     if (!track || locked) return
-
     const rect = track.getBoundingClientRect()
     const thumbSize = 48
     const travel = Math.max(rect.width - thumbSize - 8, 1)
-    const nextProgress = Math.min(Math.max((clientX - rect.left - 4 - thumbSize / 2) / travel, 0), 1)
-
     setMaxTravel(travel)
-    setProgress(nextProgress)
+    setProgress(Math.min(Math.max((clientX - rect.left - 4 - thumbSize / 2) / travel, 0), 1))
   }
 
   function handlePointerDown(event: PointerEvent<HTMLDivElement>) {
     if (locked) return
-
     event.currentTarget.setPointerCapture(event.pointerId)
     setDragging(true)
     updateProgress(event.clientX)
   }
 
   function handlePointerMove(event: PointerEvent<HTMLDivElement>) {
-    if (!dragging) return
-
-    updateProgress(event.clientX)
+    if (dragging) updateProgress(event.clientX)
   }
 
   function handlePointerEnd(event: PointerEvent<HTMLDivElement>) {
     if (!dragging || locked) return
-
     event.currentTarget.releasePointerCapture(event.pointerId)
     setDragging(false)
-
     if (progress >= 0.88) {
       setProgress(1)
       setLocked(true)
@@ -116,1433 +82,251 @@ function ContinueSlider({ onComplete }: { onComplete: () => void }) {
       window.setTimeout(onComplete, 260)
       return
     }
-
     setProgress(0)
   }
 
   return (
-    <div
-      ref={trackRef}
-      role="button"
-      tabIndex={0}
-      aria-label="Desliza para continuar"
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerEnd}
-      onPointerCancel={handlePointerEnd}
-      className="relative h-14 select-none overflow-hidden rounded-full bg-neutral-100 touch-none"
-    >
-      <p
-        className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm font-medium text-neutral-500 transition-opacity duration-150"
-        style={{ opacity: Math.max(0.28, 1 - progress * 0.72) }}
-      >
-        Desliza para continuar
-      </p>
-
-      <div
-        className={`absolute left-1 top-1 flex h-12 w-12 items-center justify-center rounded-full bg-black shadow-sm ${
-          dragging ? '' : 'transition-transform duration-300 ease-out'
-        }`}
-        style={{
-          transform: `translateX(${progress * maxTravel}px) scale(${successPulse ? 1.08 : 1})`,
-          transitionTimingFunction: successPulse
-            ? 'cubic-bezier(0.34, 1.56, 0.64, 1)'
-            : undefined,
-        }}
-      >
-        <Image
-          src="/zorro-brand-white.svg"
-          alt=""
-          aria-hidden="true"
-          width={33}
-          height={33}
-          className="h-[33px] w-[33px]"
-        />
+    <div ref={trackRef} role="button" tabIndex={0} aria-label="Desliza para continuar"
+      onPointerDown={handlePointerDown} onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerEnd} onPointerCancel={handlePointerEnd}
+      className="relative h-14 touch-none select-none overflow-hidden rounded-full bg-neutral-100">
+      <p className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm font-medium text-neutral-500 transition-opacity duration-150"
+        style={{ opacity: Math.max(0.28, 1 - progress * 0.72) }}>Desliza para continuar</p>
+      <div className={`absolute left-1 top-1 flex h-12 w-12 items-center justify-center rounded-full bg-black shadow-sm ${dragging ? '' : 'transition-transform duration-300 ease-out'}`}
+        style={{ transform: `translateX(${progress * maxTravel}px) scale(${successPulse ? 1.08 : 1})`, transitionTimingFunction: successPulse ? 'cubic-bezier(0.34, 1.56, 0.64, 1)' : undefined }}>
+        <Image src="/zorro-brand-white.svg" alt="" aria-hidden width={33} height={33} className="h-[33px] w-[33px]" />
       </div>
     </div>
   )
 }
 
-export default function ResultPage() {
-  const params = useParams()
+function ResultContent() {
   const router = useRouter()
-  const slug = params.slug as string
-
-  const [winnerText, setWinnerText] = useState('')
-  const [winnerName, setWinnerName] = useState('')
-  const [cardType, setCardType] = useState('')
+  const slug = useParams<{ slug: string }>().slug
+  const code = useSearchParams().get('code') || ''
+  const [sessionId, setSessionId] = useState<string | null>(null)
+  const [player, setPlayer] = useState<PlayerSessionResultV2 | null>(null)
+  const [namedPlayers, setNamedPlayers] = useState<Record<string, string>>({})
+  const [nextCardCode, setNextCardCode] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState('')
   const [displayedCardType, setDisplayedCardType] = useState('')
   const [isSlotRunning, setIsSlotRunning] = useState(false)
   const [slotFinished, setSlotFinished] = useState(false)
-  const [roundFinished, setRoundFinished] = useState(false)
-  const [resultExiting, setResultExiting] = useState(false)
   const [showContinueSlider, setShowContinueSlider] = useState(false)
-  const [showNextCardForm, setShowNextCardForm] = useState(false)
   const [showWinnerIntro, setShowWinnerIntro] = useState(false)
   const [showWinnerName, setShowWinnerName] = useState(false)
   const [showCardType, setShowCardType] = useState(false)
-  const [animationKey, setAnimationKey] = useState(0)
-  const [tiedPlayers, setTiedPlayers] = useState<Player[]>([])
-  const [finalRoundId, setFinalRoundId] = useState<string | null>(null)
-  const [currentGameId, setCurrentGameId] = useState<string | null>(null)
-  const [currentGameCode, setCurrentGameCode] = useState('')
-  const [nextCardCode, setNextCardCode] = useState('')
-  const [validatedNextCardSlug, setValidatedNextCardSlug] = useState<string | null>(null)
-  const [validatingNextCard, setValidatingNextCard] = useState(false)
-  const [cardScanMessage, setCardScanMessage] = useState('')
-  const [needsGameCode, setNeedsGameCode] = useState(false)
-  const [joinCode, setJoinCode] = useState('')
-  const [joinName, setJoinName] = useState('')
-  const [joinGame, setJoinGame] = useState<Game | null>(null)
-  const [joinPlayers, setJoinPlayers] = useState<JoinPlayer[]>([])
-  const [joiningGame, setJoiningGame] = useState(false)
-  const [startingTiebreak, setStartingTiebreak] = useState(false)
-  const [resolvingRandomTiebreak, setResolvingRandomTiebreak] = useState(false)
-  const [openingNextCard, setOpeningNextCard] = useState(false)
-  const [loadKey, setLoadKey] = useState(0)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [temporarySessionError, setTemporarySessionError] = useState(false)
-  const mountedRef = useRef(true)
-  const resultLoadRunningRef = useRef(false)
-  const resultLoadQueuedRef = useRef(false)
-  const resultLoadScheduledRef = useRef(false)
-  const activeCardRequestIdRef = useRef(0)
-  const finalRoundIdRef = useRef<string | null>(null)
-  const slotTimersRef = useRef<ReturnType<typeof setTimeout>[]>([])
   const displayedResultKeyRef = useRef<string | null>(null)
-  const navigateRecoverably = useRecoverableNavigation(router)
-  usePlayerHeartbeat(currentGameId)
-
-  const scheduleResultLoad = useCallback(() => {
-    if (resultLoadRunningRef.current || resultLoadScheduledRef.current) {
-      resultLoadQueuedRef.current = true
-      return
-    }
-
-    resultLoadScheduledRef.current = true
-    setLoadKey((key) => key + 1)
-  }, [])
+  const slotTimersRef = useRef<number[]>([])
+  const { state, error: canonicalError, reconcile } = useV2CanonicalState(player?.game_id || null, sessionId)
+  usePlayerHeartbeatV2(player?.game_id || null)
 
   useEffect(() => {
-    mountedRef.current = true
-
-    return () => {
-      mountedRef.current = false
-      activeCardRequestIdRef.current += 1
-      resultLoadQueuedRef.current = false
-      resultLoadScheduledRef.current = false
-    }
-  }, [])
-
-  useEffect(() => {
-    const candidateSlug = createCardSlugFromCode(nextCardCode)
-
-    if (!showNextCardForm || !candidateSlug) return
-
-    let cancelled = false
-
-    const validationTimer = setTimeout(() => {
-      cardExists(candidateSlug)
-        .then((exists) => {
-          if (!cancelled && exists) setValidatedNextCardSlug(candidateSlug)
-        })
-        .catch((validationError) => {
-          console.error('NEXT CARD INPUT VALIDATION ERROR', validationError)
-        })
-        .finally(() => {
-          if (!cancelled) setValidatingNextCard(false)
-        })
-    }, 200)
-
-    return () => {
-      cancelled = true
-      clearTimeout(validationTimer)
-    }
-  }, [nextCardCode, showNextCardForm])
-
-  const redirectToActiveCard = useCallback((activeCardValue: string, gameCode?: string | null) => {
-    const activeCardSlug = getActiveCardSlug(activeCardValue)
-    const activeCardRoundId = getActiveCardRoundId(activeCardValue)
-
-    if (
-      !activeCardSlug ||
-      (activeCardSlug === slug && !activeCardRoundId) ||
-      activeCardRoundId === finalRoundIdRef.current
-    ) {
-      return
-    }
-
-    if (activeCardRoundId) {
-      const nextParams = new URLSearchParams({
-        auto: '1',
-        round: activeCardRoundId,
-      })
-
-      if (gameCode) {
-        nextParams.set('code', gameCode)
-      }
-
-      navigateRecoverably(`/card/${activeCardSlug}?${nextParams.toString()}`)
-      return
-    }
-
-    const nextParams = new URLSearchParams({ auto: '1' })
-
-    if (gameCode) {
-      nextParams.set('code', gameCode)
-    }
-
-    if (navigateRecoverably(`/card/${activeCardSlug}?${nextParams.toString()}`, 1200)) {
-      setCardScanMessage(getCardScanMessage(activeCardValue))
-    }
-  }, [navigateRecoverably, slug])
-
-  const checkActiveCard = useCallback(async () => {
-    if (!currentGameId) return
-
-    const requestId = ++activeCardRequestIdRef.current
-    const { data: game, error: gameError } = await supabase
-      .from('public_games')
-      .select('active_card_slug')
-      .eq('id', currentGameId)
-      .single()
-
-    if (!mountedRef.current || requestId !== activeCardRequestIdRef.current) return
-
-    if (gameError) {
-      console.error('RESULT ACTIVE CARD REFRESH ERROR', gameError)
-      return
-    }
-
-    if (game?.active_card_slug) {
-      redirectToActiveCard(game.active_card_slug, currentGameCode)
-    }
-  }, [currentGameCode, currentGameId, redirectToActiveCard])
-
-  const reconcileResultState = useCallback(async () => {
-    if (temporarySessionError) {
-      scheduleResultLoad()
-      return
-    }
-
-    if (roundFinished && currentGameId) {
-      await checkActiveCard()
-      return
-    }
-
-    scheduleResultLoad()
-  }, [
-    checkActiveCard,
-    currentGameId,
-    roundFinished,
-    scheduleResultLoad,
-    temporarySessionError,
-  ])
-
-  const requestResultReconciliation = useStateReconciliation(reconcileResultState)
-
-  useEffect(() => {
-    activeCardRequestIdRef.current += 1
-  }, [currentGameId, slug])
-
-  useEffect(() => {
-    const existingStyle = document.getElementById('result-animation-style')
-
-    if (existingStyle) return
-
+    if (document.getElementById('result-animation-style')) return
     const style = document.createElement('style')
     style.id = 'result-animation-style'
     style.innerHTML = `
-      @keyframes pop {
-        0% { transform: scale(0.86); opacity: 0; }
-        65% { transform: scale(1.035); opacity: 1; }
-        100% { transform: scale(1); opacity: 1; }
-      }
-
-      @keyframes fadeUp {
-        0% { transform: translateY(12px); opacity: 0; }
-        100% { transform: translateY(0); opacity: 1; }
-      }
-
-      @keyframes resultEnter {
-        0% { transform: translateY(10px) scale(0.985); opacity: 0; }
-        100% { transform: translateY(0) scale(1); opacity: 1; }
-      }
-
-      @keyframes slotPop {
-        0% { transform: scale(1); }
-        50% { transform: scale(1.045); }
-        100% { transform: scale(1); }
-      }
+      @keyframes pop { 0% { transform: scale(0.86); opacity: 0; } 65% { transform: scale(1.035); opacity: 1; } 100% { transform: scale(1); opacity: 1; } }
+      @keyframes fadeUp { 0% { transform: translateY(12px); opacity: 0; } 100% { transform: translateY(0); opacity: 1; } }
+      @keyframes resultEnter { 0% { transform: translateY(10px) scale(0.985); opacity: 0; } 100% { transform: translateY(0) scale(1); opacity: 1; } }
+      @keyframes slotPop { 0% { transform: scale(1); } 50% { transform: scale(1.045); } 100% { transform: scale(1); } }
     `
     document.head.appendChild(style)
   }, [])
 
-  const resetSlotAnimation = useCallback(() => {
+  useEffect(() => {
+    let cancelled = false
+    async function recover() {
+      const storedSessionId = getStoredSessionId()
+      const storedName = localStorage.getItem('player_name')
+      const targetCode = code || localStorage.getItem('game_code') || ''
+      if (!storedSessionId || !targetCode) {
+        setMessage('Vuelve a entrar en la partida.')
+        setLoading(false)
+        return
+      }
+      try {
+        let recovered = await getPlayerBySessionV2(storedSessionId, targetCode)
+        if (!recovered && storedName) {
+          await joinGameByCodeV2(targetCode, storedSessionId, storedName)
+          recovered = await getPlayerBySessionV2(storedSessionId, targetCode)
+        }
+        if (cancelled) return
+        if (!recovered) throw new Error('player_not_in_game')
+        const { data, error } = await supabase.from('public_players').select('id, name').eq('game_id', recovered.game_id)
+        if (error) throw error
+        if (cancelled) return
+        setNamedPlayers(Object.fromEntries(((data || []) as Player[]).map((item) => [item.id, item.name])))
+        setSessionId(storedSessionId)
+        setPlayer(recovered)
+      } catch (error) {
+        if (!cancelled) setMessage(`No se pudo recuperar el resultado: ${getErrorMessage(error)}`)
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    void recover()
+    return () => { cancelled = true }
+  }, [code])
+
+  useEffect(() => {
+    if (!state) return
+    if (state.active_card_slug && state.active_card_slug !== slug) {
+      router.replace(`/card/${state.active_card_slug}?code=${encodeURIComponent(code || localStorage.getItem('game_code') || '')}`)
+      return
+    }
+    if (state.status === 'voting') {
+      router.replace(`/card/${slug}?code=${encodeURIComponent(code || localStorage.getItem('game_code') || '')}`)
+    }
+  }, [code, router, slug, state])
+
+  const winnerId = state?.status === 'closed' ? state.winning_player_id : null
+  const resultRoundId = state?.current_vote_round_id || null
+  const cardType = resultRoundId ? getCardTypeFromRound(resultRoundId) : ''
+  const resultKey = winnerId && resultRoundId ? `winner:${resultRoundId}:${winnerId}:${cardType}` : null
+
+  useEffect(() => {
+    if (!resultKey || displayedResultKeyRef.current === resultKey) return
+    displayedResultKeyRef.current = resultKey
     slotTimersRef.current.forEach((timer) => clearTimeout(timer))
     slotTimersRef.current = []
     setDisplayedCardType('')
     setIsSlotRunning(false)
     setSlotFinished(false)
-    setRoundFinished(false)
-    setResultExiting(false)
     setShowContinueSlider(false)
-    setShowNextCardForm(false)
     setShowWinnerIntro(false)
-  }, [])
+    setShowWinnerName(false)
+    setShowCardType(false)
 
-  const showNextCardPreparation = useCallback(() => {
-    slotTimersRef.current.forEach((timer) => clearTimeout(timer))
-    slotTimersRef.current = []
-    setIsSlotRunning(false)
-    setShowContinueSlider(false)
-    setResultExiting(true)
-    setNextCardCode('')
-    setValidatedNextCardSlug(null)
-    setValidatingNextCard(false)
-
-    const closeResultTimer = setTimeout(() => {
-      setRoundFinished(true)
-      setShowNextCardForm(true)
-      setResultExiting(false)
-    }, 180)
-
-    slotTimersRef.current.push(closeResultTimer)
-  }, [])
-
-  useEffect(() => {
-    if (resultLoadRunningRef.current) {
-      resultLoadQueuedRef.current = true
-      return
-    }
-
-    resultLoadScheduledRef.current = false
-    resultLoadRunningRef.current = true
-    let cancelled = false
-    const isCurrent = () => !cancelled && mountedRef.current
-
-    async function loadResults() {
-      try {
-        const sessionId = localStorage.getItem('session_id')
-        const roundFromQuery = new URLSearchParams(window.location.search).get('round')
-        const roundFromStorage = localStorage.getItem(`last_round_${slug}`)
-
-        if (!sessionId) {
-          setNeedsGameCode(true)
-          setLoading(false)
-          return
-        }
-
-        const storedGameCode = localStorage.getItem('game_code')
-        let currentPlayer
-
-        try {
-          currentPlayer = await getPlayerBySession(sessionId, storedGameCode)
-        } catch (playerError) {
-          if (!isCurrent()) return
-
-          console.error('RESULT PLAYER ERROR', playerError)
-
-          const recoveryErrorType = getSessionRecoveryErrorType(playerError)
-          setTemporarySessionError(true)
-          setError(
-            recoveryErrorType === 'network'
-              ? 'Se ha interrumpido la conexión. Recuperando tu partida...'
-              : 'No se pudo comprobar tu sesión. Reintentando...'
-          )
-          setLoading(false)
-          return
-        }
-
-        if (!isCurrent()) return
-
-        if (!currentPlayer) {
-          setTemporarySessionError(false)
-          setNeedsGameCode(true)
-          setLoading(false)
-          return
-        }
-
-        setTemporarySessionError(false)
-        setError(null)
-
-        setCurrentGameId(currentPlayer.game_id)
-        const { data: gameData, error: gameError } = await supabase
-          .from('public_games')
-          .select('id, code, active_card_slug')
-          .eq('id', currentPlayer.game_id)
-          .single()
-
-        if (!isCurrent()) return
-
-        if (gameError && !isMissingRowError(gameError)) {
-          throw gameError
-        }
-
-        if (!gameData) {
-          console.error('RESULT GAME ERROR', gameError)
-          setError('No se encontró la partida')
-          setLoading(false)
-          return
-        } else {
-          setCurrentGameCode(gameData.code)
-
-          const activeCardRoundId = getActiveCardRoundId(gameData.active_card_slug)
-          const activeCardSlug = getActiveCardSlug(gameData.active_card_slug)
-          const currentResultRoundId = roundFromQuery || roundFromStorage
-
-          if (
-            activeCardSlug &&
-            (
-              activeCardSlug !== slug ||
-              (activeCardRoundId && activeCardRoundId !== currentResultRoundId)
-            )
-          ) {
-            redirectToActiveCard(gameData.active_card_slug, gameData.code)
-            return
-          }
-
-          if (
-            activeCardSlug === slug &&
-            (!activeCardRoundId || activeCardRoundId === currentResultRoundId)
-          ) {
-            try {
-              await clearActiveCardIfCurrent(gameData.id, sessionId, slug)
-            } catch (clearActiveCardError) {
-              if (!isCurrent()) return
-              console.error('RESULT CLEAR ACTIVE CARD ERROR', clearActiveCardError)
-            }
-
-            if (!isCurrent()) return
-          }
-        }
-
-        const { data: card, error: cardError } = await supabase
-          .from('cards')
-          .select('id')
-          .eq('slug', slug)
-          .single()
-
-        if (!isCurrent()) return
-
-        if (cardError && !isMissingRowError(cardError)) {
-          throw cardError
-        }
-
-        if (!card) {
-          console.error('RESULT CARD ERROR', cardError)
-          setError('No se encontró la carta')
-          setLoading(false)
-          return
-        }
-
-        let resolvedRoundId = roundFromQuery || roundFromStorage
-
-        if (!resolvedRoundId) {
-          const { data: fallbackRound, error: fallbackRoundError } = await supabase
-            .from('vote_rounds')
-            .select('id')
-            .eq('game_id', currentPlayer.game_id)
-            .eq('card_id', card.id)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle()
-
-          if (!isCurrent()) return
-
-          if (fallbackRoundError) {
-            throw fallbackRoundError
-          }
-
-          if (!fallbackRound) {
-            console.error('RESULT ROUND FALLBACK ERROR', fallbackRoundError)
-            setError('No se encontró la ronda de votación')
-            setLoading(false)
-            return
-          }
-
-          resolvedRoundId = fallbackRound.id
-        }
-
-        if (!resolvedRoundId) {
-          setError('No se encontró la ronda de votación')
-          setLoading(false)
-          return
-        }
-
-        const resultRoundId = resolvedRoundId
-
-        finalRoundIdRef.current = resultRoundId
-        setFinalRoundId(resultRoundId)
-
-        const { data: resultRound, error: resultRoundError } = await supabase
-          .from('vote_rounds')
-          .select('id, status, tie_player_ids')
-          .eq('id', resultRoundId)
-          .eq('game_id', currentPlayer.game_id)
-          .eq('card_id', card.id)
-          .single()
-
-        if (!isCurrent()) return
-
-        if (resultRoundError && !isMissingRowError(resultRoundError)) {
-          throw resultRoundError
-        }
-
-        if (!resultRound) {
-          console.error('RESULT ROUND ERROR', resultRoundError)
-          setError('No se encontró la ronda de votación')
-          setLoading(false)
-          return
-        }
-
-        if (resultRound.status === 'ready_next') {
-          displayedResultKeyRef.current = null
-          setWinnerName('')
-          setCardType('')
-          setShowWinnerName(false)
-          setShowCardType(false)
-          resetSlotAnimation()
-          setTiedPlayers([])
-          setWinnerText('')
-          setRoundFinished(true)
-          setResultExiting(false)
-          setShowContinueSlider(false)
-          setShowNextCardForm(true)
-          setLoading(false)
-          return
-        }
-
-        if (
-          resultRound.status === 'closed' &&
-          resultRound.tie_player_ids &&
-          resultRound.tie_player_ids.length === 1
-        ) {
-          const { data: resolvedWinner, error: resolvedWinnerError } = await supabase
-            .from('public_players')
-            .select('id, name')
-            .eq('id', resultRound.tie_player_ids[0])
-            .single()
-
-          if (!isCurrent()) return
-
-          if (resolvedWinnerError && !isMissingRowError(resolvedWinnerError)) {
-            throw resolvedWinnerError
-          }
-
-          if (!resolvedWinner) {
-            console.error('RANDOM TIEBREAK WINNER ERROR', resolvedWinnerError)
-            setError('No se pudo cargar el desempate aleatorio')
-            setLoading(false)
-            return
-          }
-
-          const nextCardType = getCardTypeFromRound(resultRoundId)
-          const nextResultKey = `winner:${resultRoundId}:${resolvedWinner.id}:${nextCardType}`
-
-          setWinnerName(resolvedWinner.name)
-          setCardType(nextCardType)
-          setTiedPlayers([])
-          setWinnerText('')
-
-          if (displayedResultKeyRef.current !== nextResultKey) {
-            displayedResultKeyRef.current = nextResultKey
-            setShowWinnerName(false)
-            setShowCardType(false)
-            resetSlotAnimation()
-            setAnimationKey((key) => key + 1)
-          }
-
-          setLoading(false)
-          return
-        }
-
-        const roundResult = await getRoundResult(resultRoundId, sessionId)
-
-        if (!isCurrent()) return
-        const requiredVoteCount = roundResult.required_vote_count
-        const uniqueVoterCount = roundResult.vote_count
-        const roundIsClosed = resultRound.status === 'closed'
-        const roundIsComplete = requiredVoteCount > 0 && uniqueVoterCount >= requiredVoteCount
-
-        if (!roundIsClosed && !roundIsComplete) {
-          displayedResultKeyRef.current = null
-          setWinnerName('')
-          setCardType('')
-          setShowWinnerName(false)
-          setShowCardType(false)
-          resetSlotAnimation()
-          setTiedPlayers([])
-          setWinnerText('Esperando a que todos voten')
-          setLoading(false)
-          return
-        }
-
-        if (roundResult.vote_count === 0) {
-          displayedResultKeyRef.current = null
-          setWinnerName('')
-          setCardType('')
-          setShowWinnerName(false)
-          setShowCardType(false)
-          resetSlotAnimation()
-          setTiedPlayers([])
-          setWinnerText('Todavía no hay votos')
-          setLoading(false)
-          return
-        }
-
-        const winners = roundResult.winners.map((winner) => ({
-          id: winner.id,
-          name: winner.name,
-        }))
-
-        if (winners.length === 0) {
-          displayedResultKeyRef.current = null
-          setWinnerName('')
-          setCardType('')
-          setShowWinnerName(false)
-          setShowCardType(false)
-          resetSlotAnimation()
-          setTiedPlayers([])
-          setWinnerText('Todavía no hay votos')
-        } else if (winners.length === 1) {
-          const nextCardType = getCardTypeFromRound(resultRoundId)
-          const nextResultKey = `winner:${resultRoundId}:${winners[0].id}:${nextCardType}`
-
-          setWinnerName(winners[0].name)
-          setCardType(nextCardType)
-          setTiedPlayers([])
-          setWinnerText('')
-
-          if (displayedResultKeyRef.current !== nextResultKey) {
-            displayedResultKeyRef.current = nextResultKey
-            setShowWinnerName(false)
-            setShowCardType(false)
-            resetSlotAnimation()
-            setAnimationKey((key) => key + 1)
-          }
-        } else {
-          displayedResultKeyRef.current = `tie:${resultRoundId}:${winners.map((winner) => winner.id).join(',')}`
-          setWinnerName('')
-          setCardType('')
-          setShowWinnerName(false)
-          setShowCardType(false)
-          resetSlotAnimation()
-          setTiedPlayers(winners)
-          setWinnerText(`Empate entre ${winners.map((winner) => winner.name).join(', ')}`)
-        }
-
-        if (winners.length <= 1 && !roundIsClosed) {
-          try {
-            await closeVoteRoundIfComplete(resultRoundId, sessionId)
-          } catch (closeRoundError) {
-            if (!isCurrent()) return
-            console.error('RESULT CLOSE ROUND ERROR', closeRoundError)
-          }
-        }
-
-        if (!isCurrent()) return
-        setLoading(false)
-      } catch (err) {
-        if (!isCurrent()) return
-        console.error('RESULT LOAD ERROR', err)
-        setTemporarySessionError(true)
-        setError('No se pudo actualizar el resultado. Reintentando...')
-        setLoading(false)
-      }
-    }
-
-    void loadResults().finally(() => {
-      resultLoadRunningRef.current = false
-
-      if (!mountedRef.current || !resultLoadQueuedRef.current) return
-
-      resultLoadQueuedRef.current = false
-      resultLoadScheduledRef.current = true
-      setLoadKey((key) => key + 1)
-    })
+    const introTimer = window.setTimeout(() => setShowWinnerIntro(true), 520)
+    const winnerTimer = window.setTimeout(() => setShowWinnerName(true), 2150)
+    const cardTypeTimer = window.setTimeout(() => setShowCardType(true), 3850)
+    slotTimersRef.current.push(introTimer, winnerTimer, cardTypeTimer)
 
     return () => {
-      cancelled = true
+      slotTimersRef.current.forEach((timer) => clearTimeout(timer))
+      slotTimersRef.current = []
     }
-  }, [slug, resetSlotAnimation, showNextCardPreparation, redirectToActiveCard, loadKey])
+  }, [resultKey])
 
   useEffect(() => {
-    if (!temporarySessionError) return
-
-    const retryIntervalId = window.setInterval(
-      requestResultReconciliation,
-      5000
-    )
-
-    return () => window.clearInterval(retryIntervalId)
-  }, [requestResultReconciliation, temporarySessionError])
-
-  useEffect(() => {
-    if (!currentGameId) return
-
-    const channel = supabase
-      .channel(`result-game:${currentGameId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'realtime_events',
-          filter: `game_id=eq.${currentGameId}`,
-        },
-        (payload) => {
-          const eventType = (payload.new as { event_type?: string }).event_type
-
-          if (eventType === 'game_changed') {
-            requestResultReconciliation()
-          }
-        }
-      )
-      .subscribe((status) => {
-        if (status === 'SUBSCRIBED') {
-          requestResultReconciliation()
-        } else if (
-          status === 'CHANNEL_ERROR' ||
-          status === 'TIMED_OUT' ||
-          status === 'CLOSED'
-        ) {
-          console.warn(`RESULT GAME REALTIME ${status}`)
-        }
-      })
-
-    return () => {
-      supabase.removeChannel(channel)
-    }
-  }, [
-    currentGameId,
-    requestResultReconciliation,
-  ])
-
-  useEffect(() => {
-    if (!finalRoundId || roundFinished) return
-
-    const refreshIntervalId = window.setInterval(
-      requestResultReconciliation,
-      3000
-    )
-
-    const channel = supabase
-      .channel(`result-round:${finalRoundId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'realtime_events',
-          filter: `vote_round_id=eq.${finalRoundId}`,
-        },
-        requestResultReconciliation
-      )
-      .subscribe((status) => {
-        if (status === 'SUBSCRIBED') {
-          requestResultReconciliation()
-        } else if (
-          status === 'CHANNEL_ERROR' ||
-          status === 'TIMED_OUT' ||
-          status === 'CLOSED'
-        ) {
-          console.warn(`RESULT ROUND REALTIME ${status}`)
-        }
-      })
-
-    return () => {
-      window.clearInterval(refreshIntervalId)
-      supabase.removeChannel(channel)
-    }
-  }, [
-    finalRoundId,
-    requestResultReconciliation,
-    roundFinished,
-    showNextCardPreparation,
-  ])
-
-  useEffect(() => {
-    if (!roundFinished || !currentGameId) return
-
-    const activeCardPollId = window.setInterval(
-      requestResultReconciliation,
-      8000
-    )
-
-    return () => window.clearInterval(activeCardPollId)
-  }, [currentGameId, requestResultReconciliation, roundFinished])
-
-  useEffect(() => {
-    if (!finalRoundId || roundFinished) return
-    const currentFinalRoundId = finalRoundId
-
-    async function checkRoundStatus() {
-      const sessionId = localStorage.getItem('session_id')
-
-      if (!sessionId) return
-
-      const round = await getRoundResult(currentFinalRoundId, sessionId).catch((roundError) => {
-        console.error('READY NEXT CHECK ERROR', roundError)
-        return null
-      })
-
-      if (round?.status === 'ready_next') {
-        showNextCardPreparation()
-      }
-    }
-
-    checkRoundStatus()
-  }, [finalRoundId, roundFinished, showNextCardPreparation])
-
-  useEffect(() => {
-    if (loading || error || !winnerName) return
-
-    const introTimer = setTimeout(() => {
-      setShowWinnerIntro(true)
-    }, 520)
-
-    const winnerTimer = setTimeout(() => {
-      setShowWinnerName(true)
-    }, 2150)
-
-    const cardTypeTimer = setTimeout(() => {
-      setShowCardType(true)
-    }, 3850)
-
-    return () => {
-      clearTimeout(introTimer)
-      clearTimeout(winnerTimer)
-      clearTimeout(cardTypeTimer)
-    }
-  }, [loading, error, winnerName, animationKey])
-
-  useEffect(() => {
-    if (!showCardType || !cardType) return
-
+    if (!showCardType || !cardType || !resultKey) return
     const delays = [110, 140, 180, 240, 320, 440, 620]
-
-    slotTimersRef.current.forEach((timer) => clearTimeout(timer))
-    slotTimersRef.current = []
-
-    const startTimer = setTimeout(() => {
+    const startTimer = window.setTimeout(() => {
       let elapsed = 0
-
       setDisplayedCardType(cardType === 'RETO' ? 'CONFESIÓN' : 'RETO')
       setIsSlotRunning(true)
       setSlotFinished(false)
 
       delays.forEach((delay, index) => {
         elapsed += delay
-
-        const timer = setTimeout(() => {
-          const isLastStep = index === delays.length - 1
-
-          if (isLastStep) {
+        const timer = window.setTimeout(() => {
+          if (index === delays.length - 1) {
             setDisplayedCardType(cardType)
             setIsSlotRunning(false)
             setSlotFinished(true)
             vibrateSlotResult()
-
-            const continueSliderTimer = setTimeout(() => {
-              setShowContinueSlider(true)
-            }, 650)
-
-            slotTimersRef.current.push(continueSliderTimer)
+            slotTimersRef.current.push(window.setTimeout(() => setShowContinueSlider(true), 650))
             return
           }
-
           setDisplayedCardType(index % 2 === 0 ? 'RETO' : 'CONFESIÓN')
         }, elapsed)
-
         slotTimersRef.current.push(timer)
       })
     }, 0)
-
     slotTimersRef.current.push(startTimer)
-
-    return () => {
-      slotTimersRef.current.forEach((timer) => clearTimeout(timer))
-      slotTimersRef.current = []
-    }
-  }, [showCardType, cardType, animationKey])
+  }, [cardType, resultKey, showCardType])
 
   function finishSlotAnimation() {
     if (!isSlotRunning || !cardType) return
-
     slotTimersRef.current.forEach((timer) => clearTimeout(timer))
     slotTimersRef.current = []
     setDisplayedCardType(cardType)
     setIsSlotRunning(false)
     setSlotFinished(true)
-    vibrateSlotResult()
     setShowContinueSlider(true)
+    vibrateSlotResult()
   }
 
-  async function handleContinueToNextCardForm() {
-    if (!finalRoundId) {
-      showNextCardPreparation()
-      return
-    }
-
-    setError(null)
-
-    const sessionId = localStorage.getItem('session_id')
-
-    if (!sessionId) {
-      setError('No se pudo identificar tu sesión')
-      return
-    }
-
+  async function runTransition(
+    action: string,
+    call: (operationId: string, expectedVersion: number) => Promise<unknown>
+  ) {
+    if (!player || !state || busy) return false
+    setBusy(true)
+    setMessage('')
+    const expectedVersion = state.transition_version
+    const operationId = getOrCreateOperationId(player.game_id, action, { action, roundId: state.current_vote_round_id, expectedVersion })
     try {
-      await markRoundReadyNext(finalRoundId, sessionId)
-    } catch (updateError) {
-      console.error('READY NEXT UPDATE ERROR', updateError)
-      setError('No se pudo preparar la siguiente carta')
-      return
+      await retryUncertainV2Mutation(() => call(operationId, expectedVersion))
+      clearOperationId(player.game_id, action)
+      await reconcile()
+      return true
+    } catch (error) {
+      await reconcile()
+      setMessage(isStaleTransitionError(error) ? 'La partida cambió. Se ha cargado el estado actual.' : `No se pudo completar la acción: ${getErrorMessage(error)}`)
+      return false
+    } finally {
+      setBusy(false)
     }
-
-    showNextCardPreparation()
   }
 
-  async function handleGoToNextCardByCode() {
-    const requestedCardSlug = createCardSlugFromCode(nextCardCode)
-    const nextCardSlug = validatedNextCardSlug
-
-    if (
-      !nextCardSlug ||
-      nextCardSlug !== requestedCardSlug ||
-      !currentGameId ||
-      openingNextCard
-    ) return
-
-    setOpeningNextCard(true)
-    setError(null)
-
-    const sessionId = localStorage.getItem('session_id')
-
-    if (!sessionId) {
-      setError('No se pudo identificar tu sesión')
-      setOpeningNextCard(false)
-      return
-    }
-
-    try {
-      let player = await getPlayerBySession(sessionId, currentGameCode || null).catch((playerError) => {
-        console.error('NEXT CARD PLAYER SESSION ERROR', playerError)
-        return null
-      })
-
-      if (!player && currentGameCode) {
-        const storedPlayerName = localStorage.getItem('player_name')
-
-        if (storedPlayerName) {
-          player = await joinGameByCode(currentGameCode, sessionId, storedPlayerName)
-            .then(() => getPlayerBySession(sessionId, currentGameCode))
-            .catch((reconnectError) => {
-              console.error('NEXT CARD RECONNECT ERROR', reconnectError)
-              return null
-            })
-        }
-      }
-
-      if (!player || player.game_id !== currentGameId) {
-        setError('Vuelve a entrar en la partida antes de abrir la siguiente carta')
-        setOpeningNextCard(false)
-        return
-      }
-
-      await activateGameCard(currentGameId, sessionId, nextCardSlug)
-    } catch (activeCardError) {
-      console.error('NEXT ACTIVE CARD ERROR', activeCardError)
-      setError(`No se pudo abrir la siguiente carta: ${getErrorMessage(activeCardError)}`)
-      setOpeningNextCard(false)
-      return
-    }
-
-    router.push(`/card/${nextCardSlug}`)
-  }
-
-  async function handleTiebreak() {
-    if (
-      !finalRoundId ||
-      tiedPlayers.length < 2 ||
-      startingTiebreak ||
-      resolvingRandomTiebreak
-    ) return
-
-    setStartingTiebreak(true)
-
-    const tiedPlayerIds = tiedPlayers.map((player) => player.id)
-    const sessionId = localStorage.getItem('session_id')
-
-    if (!sessionId) {
-      setError('No se pudo identificar tu sesión')
-      setStartingTiebreak(false)
-      return
-    }
-
-    let tiebreakRoundId: string
-
-    try {
-      tiebreakRoundId = await startTiebreakRound(finalRoundId, sessionId, tiedPlayerIds)
-    } catch (tiebreakError) {
-      console.error('TIEBREAK ROUND ERROR', tiebreakError)
-      setError(`No se pudo crear el desempate: ${getErrorMessage(tiebreakError)}`)
-      setStartingTiebreak(false)
-      return
-    }
-
-    localStorage.setItem(`last_round_${slug}`, tiebreakRoundId)
-    const nextParams = new URLSearchParams({ auto: '1', round: tiebreakRoundId })
-
-    if (currentGameCode) {
-      nextParams.set('code', currentGameCode)
-    }
-
-    router.push(`/card/${slug}?${nextParams.toString()}`)
+  async function handleStartTiebreak() {
+    if (!state?.current_vote_round_id || !sessionId) return
+    await runTransition(`tiebreak:${state.current_vote_round_id}`, (operationId, expectedVersion) => startTiebreakRoundV2(state.current_vote_round_id!, sessionId, operationId, expectedVersion))
   }
 
   async function handleRandomTiebreak() {
-    if (!finalRoundId || tiedPlayers.length < 2 || resolvingRandomTiebreak || startingTiebreak) {
-      return
-    }
-
-    setResolvingRandomTiebreak(true)
-    setError(null)
-
-    const sessionId = localStorage.getItem('session_id')
-
-    if (!sessionId) {
-      setError('No se pudo identificar tu sesión')
-      setResolvingRandomTiebreak(false)
-      return
-    }
-
-    try {
-      await resolveRandomTiebreak(
-        finalRoundId,
-        sessionId,
-        tiedPlayers.map((player) => player.id)
-      )
-    } catch (updateError) {
-      console.error('RANDOM TIEBREAK UPDATE ERROR', updateError)
-      setError(`No se pudo resolver el desempate aleatorio: ${getErrorMessage(updateError)}`)
-      setResolvingRandomTiebreak(false)
-      return
-    }
-
-    localStorage.setItem(`last_round_${slug}`, finalRoundId)
-    setLoadKey((key) => key + 1)
-    setResolvingRandomTiebreak(false)
+    if (!state?.current_vote_round_id || !sessionId) return
+    await runTransition(`random:${state.current_vote_round_id}`, (operationId, expectedVersion) => resolveRandomTiebreakV2(state.current_vote_round_id!, sessionId, operationId, expectedVersion))
   }
 
-  function finishJoinFromResult(newSessionId: string, cleanCode: string, playerName: string) {
-    storeGameSession(newSessionId, cleanCode, playerName)
-
-    setNeedsGameCode(false)
-    setLoading(true)
-    setLoadKey((key) => key + 1)
+  async function handleReadyNext() {
+    if (!state?.current_vote_round_id || !sessionId) return
+    await runTransition(`ready:${state.current_vote_round_id}`, (operationId, expectedVersion) => markRoundReadyNextV2(state.current_vote_round_id!, sessionId, operationId, expectedVersion))
   }
 
-  async function handleFindGameFromResult(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    setError(null)
-
-    if (!joinCode.trim()) {
-      setError('Escribe el código de partida')
+  async function handleNextCard() {
+    const nextSlug = createCardSlugFromCode(nextCardCode)
+    if (!nextSlug || !player || !state || !sessionId || busy) return
+    if (!(await cardExists(nextSlug))) {
+      setMessage('No existe esa carta.')
       return
     }
-
-    try {
-      setJoiningGame(true)
-
-      const cleanCode = joinCode.trim().toUpperCase()
-      const { data: gameData, error: gameError } = await supabase
-        .from('public_games')
-        .select('id, code')
-        .eq('code', cleanCode)
-        .single()
-
-      if (gameError || !gameData) {
-        setError('No existe esa partida')
-        return
-      }
-
-      const { data: playerList, error: playersError } = await supabase
-        .from('public_players')
-        .select('id, name')
-        .eq('game_id', gameData.id)
-        .order('created_at', { ascending: true })
-
-      if (playersError || !playerList) {
-        throw new Error(getErrorMessage(playersError))
-      }
-
-      setJoinGame(gameData)
-      setJoinPlayers(playerList)
-    } catch (err) {
-      const message = getErrorMessage(err)
-      console.error('RESULT FIND GAME ERROR', message, err)
-      setError(`No se pudo cargar la partida: ${message}`)
-    } finally {
-      setJoiningGame(false)
-    }
+    const succeeded = await runTransition(`activate:${nextSlug}`, (operationId, expectedVersion) => activateGameCardV2(player.game_id, sessionId, nextSlug, operationId, expectedVersion))
+    if (succeeded) router.replace(`/card/${nextSlug}?code=${encodeURIComponent(code || player.code)}`)
   }
 
-  async function handleJoinResultAsNewPlayer(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-
-    if (!joinGame) return
-
-    setError(null)
-
-    if (!joinName.trim()) {
-      setError('Escribe tu nombre')
-      return
-    }
-
-    try {
-      setJoiningGame(true)
-
-      const newSessionId = getOrCreateSessionId()
-      const joinedGame = await joinGameByCode(joinGame.code, newSessionId, joinName.trim())
-
-      finishJoinFromResult(newSessionId, joinedGame.code, joinName.trim())
-    } catch (err) {
-      const message = getErrorMessage(err)
-      console.error('RESULT NEW PLAYER JOIN ERROR', message, err)
-      setError(`No se pudo unir a la partida: ${message}`)
-    } finally {
-      setJoiningGame(false)
-    }
-  }
-
-  if (needsGameCode) {
-    return (
-      <main className="min-h-screen bg-neutral-100 flex items-center justify-center">
-        <div className="w-full max-w-md px-6 py-10">
-          <div className="relative rounded-3xl bg-white p-6 shadow-sm ring-1 ring-black/5">
-            <Image
-              src="/zorro-brand-black.svg"
-              alt=""
-              aria-hidden="true"
-              width={60}
-              height={60}
-              className="absolute right-5 top-4 h-[60px] w-[60px] opacity-75"
-            />
-
-            <h1 className="pr-12 text-2xl font-bold tracking-tight">
-              Recuperar resultado
-            </h1>
-            <p className="mt-2 text-sm text-neutral-600">
-              Introduce el código de partida y elige quién eres para volver al resultado.
-            </p>
-
-            {!joinGame ? (
-              <form onSubmit={handleFindGameFromResult}>
-                <div className="mt-6">
-                  <label className="mb-2 block text-sm font-medium">
-                    Código de partida
-                  </label>
-                  <input
-                    type="text"
-                    value={joinCode}
-                    onChange={(event) => setJoinCode(event.target.value.toUpperCase())}
-                    placeholder="Ej. A7KD"
-                    className="w-full rounded-2xl border border-neutral-300 px-4 py-3 uppercase outline-none focus:border-neutral-500"
-                  />
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={joiningGame}
-                  className="mt-5 w-full rounded-2xl bg-black px-4 py-3 font-medium text-white transition hover:opacity-90 disabled:opacity-50"
-                >
-                  {joiningGame ? 'Buscando...' : 'Continuar'}
-                </button>
-              </form>
-            ) : (
-              <>
-                <p className="mt-6 text-sm font-semibold text-neutral-900">
-                  ¿Quién eres?
-                </p>
-
-                {joinPlayers.length > 0 ? (
-                  <div className="mt-3 space-y-2">
-                    {joinPlayers.map((player) => (
-                      <div
-                        key={player.id}
-                        className="w-full rounded-2xl border border-neutral-200 px-4 py-3 font-medium text-neutral-500"
-                      >
-                        {player.name}
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="mt-3 text-sm text-neutral-500">
-                    Todavía no hay jugadores en esta partida.
-                  </p>
-                )}
-
-                <div className="my-5 h-px bg-neutral-200" />
-
-                <p className="text-sm text-neutral-500">
-                  Por seguridad, no se puede recuperar otro jugador desde este dispositivo.
-                </p>
-
-                <form onSubmit={handleJoinResultAsNewPlayer}>
-                  <label className="mb-2 block text-sm font-medium">
-                    Soy alguien nuevo
-                  </label>
-                  <input
-                    type="text"
-                    value={joinName}
-                    onChange={(event) => setJoinName(event.target.value)}
-                    placeholder="Tu nombre"
-                    className="w-full rounded-2xl border border-neutral-300 px-4 py-3 outline-none focus:border-neutral-500"
-                  />
-
-                  <button
-                    type="submit"
-                    disabled={joiningGame}
-                    className="mt-3 w-full rounded-2xl bg-black px-4 py-3 font-medium text-white transition hover:opacity-90 disabled:opacity-50"
-                  >
-                    {joiningGame ? 'Entrando...' : 'Entrar como nuevo jugador'}
-                  </button>
-                </form>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    setJoinGame(null)
-                    setJoinPlayers([])
-                    setError(null)
-                  }}
-                  className="mt-3 w-full rounded-2xl border border-neutral-300 px-4 py-3 font-medium text-neutral-900 transition hover:bg-neutral-50"
-                >
-                  Cambiar código
-                </button>
-              </>
-            )}
-
-            {error ? (
-              <p className="mt-4 text-sm font-medium text-red-600">{error}</p>
-            ) : null}
-          </div>
-        </div>
-      </main>
-    )
-  }
+  const tiedIds = state?.tie_player_ids && state.tie_player_ids.length > 1 ? state.tie_player_ids : []
+  const winnerName = winnerId ? namedPlayers[winnerId] || 'Jugador' : ''
+  const effectiveMessage = canonicalError ? `Recuperando estado: ${getErrorMessage(canonicalError)}` : message
 
   return (
-    <main className="min-h-screen bg-neutral-100 flex items-center justify-center">
-      <div className="w-full max-w-md px-6 py-10">
-        <div className="relative rounded-3xl bg-white p-6 shadow-sm ring-1 ring-black/5">
-          <Image
-            src="/zorro-brand-black.svg"
-            alt=""
-            aria-hidden="true"
-            width={60}
-            height={60}
-            className="absolute right-5 top-4 h-[60px] w-[60px] opacity-75"
-          />
-
-          {loading ? (
-            <p className="text-neutral-600">Cargando...</p>
-          ) : error ? (
-            <>
-              <p className="text-red-600">{error}</p>
-              <button
-                onClick={() => router.push('/')}
-                className="mt-6 w-full rounded-2xl border px-4 py-3 font-medium"
-              >
-                Volver
-              </button>
-            </>
-          ) : cardScanMessage ? (
-            <p className="rounded-2xl bg-black px-4 py-3 text-center font-medium text-white">
-              {cardScanMessage}
-            </p>
-          ) : (
-            <>
-              {currentGameCode ? (
-                <div className="mb-4 pr-12">
-                  <p className="text-sm text-neutral-500">Partida</p>
-                  <p className="text-lg font-semibold text-neutral-900">
-                    {currentGameCode}
-                  </p>
-                </div>
-              ) : null}
-
-              {!roundFinished ? (
-                <div
-                  className={`min-h-[320px] rounded-3xl bg-black p-8 text-center text-white flex items-center justify-center animate-[resultEnter_0.42s_ease-out] transition-all duration-200 ease-out ${
-                    resultExiting ? 'translate-y-1 scale-[0.985] opacity-0' : 'translate-y-0 scale-100 opacity-100'
-                  }`}
-                >
-                  {winnerName ? (
-                    <div className="w-full">
-                      <div className="animate-[fadeUp_0.42s_ease-out]">
-                        <p
-                          aria-label={RESULT_INTRO_TEXT}
-                          className={`flex min-h-[1.5rem] items-center justify-center text-lg font-semibold leading-tight text-white/65 transition-opacity duration-700 ease-out ${
-                            showWinnerIntro ? 'opacity-100' : 'opacity-0'
-                          }`}
-                        >
-                          {RESULT_INTRO_TEXT}
-                        </p>
-
-                        <div className="mt-6 flex min-h-[5.25rem] items-center justify-center">
-                          <p
-                            className={`overflow-hidden break-words text-[clamp(2.75rem,15vw,4.5rem)] font-extrabold uppercase tracking-tight leading-[0.92] transition-all duration-700 ease-out ${
-                              showWinnerName
-                                ? 'translate-y-0 scale-100 opacity-100'
-                                : 'translate-y-2 scale-[0.98] opacity-0'
-                            }`}
-                          >
-                            {winnerName}
-                          </p>
-                        </div>
-
-                        {showCardType ? (
-                          <div
-                            onClick={finishSlotAnimation}
-                            className="mt-8 rounded-3xl bg-white px-5 py-5 text-black shadow-sm animate-[fadeUp_0.42s_ease-out]"
-                          >
-                            <p className="text-xs font-semibold uppercase tracking-[0.25em] text-neutral-500">
-                              Coge una carta
-                            </p>
-                            <p
-                              className={`mt-2 text-4xl font-extrabold tracking-tight transition-transform duration-300 ${
-                                slotFinished
-                                  ? 'animate-[slotPop_0.24s_ease-out]'
-                                  : isSlotRunning
-                                    ? 'scale-[1.025]'
-                                    : 'scale-100'
-                              }`}
-                            >
-                              {displayedCardType || cardType}
-                            </p>
-                          </div>
-                        ) : null}
-                      </div>
-                    </div>
-                  ) : tiedPlayers.length > 1 ? (
-                    <div className="w-full animate-[pop_0.52s_ease-out]">
-                      <p className="text-5xl font-extrabold leading-tight">
-                        ¡Empate!
-                      </p>
-
-                      <div className="mt-6 space-y-2">
-                        {tiedPlayers.map((player) => (
-                          <div
-                            key={player.id}
-                            className="rounded-2xl bg-white/10 px-4 py-3 text-xl font-bold"
-                          >
-                            {player.name}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="w-full animate-[pop_0.52s_ease-out]">
-                      <p className="text-4xl font-extrabold leading-tight">
-                        {winnerText}
-                      </p>
-                    </div>
-                  )}
-                </div>
-              ) : null}
-
-              {!roundFinished && tiedPlayers.length > 1 ? (
-                <div className="mt-6 rounded-3xl border border-neutral-200 p-4 animate-[fadeUp_0.5s_ease-out]">
-                  <p className="text-sm font-semibold text-neutral-900">
-                    Desempate
-                  </p>
-                  <p className="mt-1 text-sm text-neutral-500">
-                    Todos votan otra vez, pero solo entre estos jugadores.
-                  </p>
-
-                  <button
-                    onClick={handleTiebreak}
-                    disabled={startingTiebreak || resolvingRandomTiebreak}
-                    className="mt-4 w-full rounded-2xl bg-black px-4 py-3 font-medium text-white transition hover:opacity-90 disabled:opacity-50"
-                  >
-                    {startingTiebreak ? 'Preparando desempate...' : 'Empezar desempate'}
-                  </button>
-
-                  <button
-                    onClick={handleRandomTiebreak}
-                    disabled={startingTiebreak || resolvingRandomTiebreak}
-                    className="mt-3 w-full rounded-2xl border border-neutral-300 px-4 py-3 font-medium text-neutral-900 transition hover:bg-neutral-50 disabled:opacity-50"
-                  >
-                    {resolvingRandomTiebreak
-                      ? 'Resolviendo desempate...'
-                      : 'Desempate aleatorio'}
-                  </button>
-                </div>
-              ) : null}
-
-              {!roundFinished && winnerName && slotFinished && showContinueSlider && !showNextCardForm ? (
-                <div className="mt-6 animate-[fadeUp_0.5s_ease-out]">
-                  <ContinueSlider onComplete={handleContinueToNextCardForm} />
-                </div>
-              ) : null}
-
-              {showNextCardForm && (roundFinished || (winnerName && slotFinished)) ? (
-                <div className="mt-6 rounded-3xl border border-neutral-200 p-4 animate-[fadeUp_0.5s_ease-out]">
-                  <p className="text-sm font-semibold text-neutral-900">
-                    Siguiente carta
-                  </p>
-                  <p className="mt-1 text-sm text-neutral-500">
-                    Escanea o introduce el número de la siguiente carta.
-                  </p>
-
-                  <div className="mt-4 flex items-center gap-2">
-                    <div className="rounded-2xl bg-neutral-100 px-4 py-3 font-semibold text-neutral-600">
-                      V-
-                    </div>
-                    <input
-                      type="text"
-                      inputMode="numeric"
-                      value={nextCardCode}
-                      onChange={(event) => {
-                        const value = event.target.value
-                        if (/^\d{0,3}$/.test(value)) {
-                          setNextCardCode(value)
-                          setValidatedNextCardSlug(null)
-                          setValidatingNextCard(!!createCardSlugFromCode(value))
-                        }
-                      }}
-                      onBlur={() => {
-                        const normalizedSlug = createCardSlugFromCode(nextCardCode)
-                        if (normalizedSlug) setNextCardCode(normalizedSlug.slice(-3))
-                      }}
-                      placeholder="001"
-                      className="min-w-0 flex-1 rounded-2xl border border-neutral-300 px-4 py-3 outline-none focus:border-neutral-500"
-                    />
-                  </div>
-
-                  <button
-                    onClick={handleGoToNextCardByCode}
-                    disabled={
-                      validatingNextCard ||
-                      !validatedNextCardSlug ||
-                      validatedNextCardSlug !== createCardSlugFromCode(nextCardCode) ||
-                      openingNextCard
-                    }
-                    className="mt-3 w-full rounded-2xl bg-black px-4 py-3 font-medium text-white transition hover:opacity-90 disabled:opacity-40"
-                  >
-                    {openingNextCard ? 'Abriendo carta...' : 'Votar'}
-                  </button>
-                </div>
-              ) : null}
-            </>
-          )}
+    <main className="min-h-screen bg-neutral-100 text-neutral-900"><div className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-10"><div className="relative rounded-3xl bg-white px-6 pb-6 pt-20 text-center shadow-sm ring-1 ring-black/5">
+      <Image src="/zorro-brand-black.svg" alt="" aria-hidden width={60} height={60} className="absolute right-5 top-4 h-[60px] w-[60px] opacity-75" />
+      {loading || !state ? <p className="mt-2">Recuperando resultado…</p> : null}
+      {state?.status === 'closed' && winnerName ? <>
+        <div className="mt-2 flex min-h-[320px] items-center justify-center rounded-3xl bg-black p-8 text-center text-white animate-[resultEnter_0.42s_ease-out]">
+          <div className="w-full animate-[fadeUp_0.42s_ease-out]">
+            <p aria-label={RESULT_INTRO_TEXT} className={`flex min-h-[1.5rem] items-center justify-center text-lg font-semibold leading-tight text-white/65 transition-opacity duration-700 ease-out ${showWinnerIntro ? 'opacity-100' : 'opacity-0'}`}>{RESULT_INTRO_TEXT}</p>
+            <div className="mt-6 flex min-h-[5.25rem] items-center justify-center"><p className={`overflow-hidden break-words text-[clamp(2.75rem,15vw,4.5rem)] font-extrabold uppercase leading-[0.92] tracking-tight transition-all duration-700 ease-out ${showWinnerName ? 'translate-y-0 scale-100 opacity-100' : 'translate-y-2 scale-[0.98] opacity-0'}`}>{winnerName}</p></div>
+            {showCardType ? <div onClick={finishSlotAnimation} className="mt-8 rounded-3xl bg-white px-5 py-5 text-black shadow-sm animate-[fadeUp_0.42s_ease-out]">
+              <p className="text-xs font-semibold uppercase tracking-[0.25em] text-neutral-500">Coge una carta</p>
+              <p className={`mt-2 text-4xl font-extrabold tracking-tight transition-transform duration-300 ${slotFinished ? 'animate-[slotPop_0.24s_ease-out]' : isSlotRunning ? 'scale-[1.025]' : 'scale-100'}`}>{displayedCardType || cardType}</p>
+            </div> : null}
+          </div>
         </div>
-      </div>
-    </main>
+        {slotFinished && showContinueSlider ? <div className="mt-6 animate-[fadeUp_0.5s_ease-out]"><ContinueSlider onComplete={() => void handleReadyNext()} /></div> : null}
+      </> : null}
+      {state?.status === 'closed' && tiedIds.length > 1 ? <><div className="mt-2 flex min-h-[320px] items-center justify-center rounded-3xl bg-black p-8 text-center text-white animate-[resultEnter_0.42s_ease-out]"><div className="w-full animate-[pop_0.52s_ease-out]"><p className="text-5xl font-extrabold leading-tight">¡Empate!</p><div className="mt-6 space-y-2">{tiedIds.map((id) => <div key={id} className="rounded-2xl bg-white/10 px-4 py-3 text-xl font-bold">{namedPlayers[id] || 'Jugador'}</div>)}</div></div></div><div className="mt-6 rounded-3xl border border-neutral-200 p-4 animate-[fadeUp_0.5s_ease-out]"><p className="text-sm font-semibold">Desempate</p><p className="mt-1 text-sm text-neutral-500">Todos votan otra vez, pero solo entre estos jugadores.</p><button disabled={busy} onClick={() => void handleStartTiebreak()} className="mt-4 w-full rounded-2xl bg-black px-4 py-3 font-medium text-white disabled:opacity-40">Nueva votación de desempate</button><button disabled={busy} onClick={() => void handleRandomTiebreak()} className="mt-3 w-full rounded-2xl border border-neutral-300 px-4 py-3 font-medium disabled:opacity-40">Resolver por sorteo</button></div></> : null}
+      {state?.status === 'ready_next' ? <div className="mt-2 rounded-3xl border border-neutral-200 p-4 text-left"><p className="font-medium">Escanea la siguiente carta</p><div className="mt-4 flex gap-2"><span className="rounded-2xl bg-neutral-100 px-4 py-3 font-semibold">V-</span><input value={nextCardCode} onChange={(event) => setNextCardCode(event.target.value.replace(/\D/g, '').slice(0, 3))} inputMode="numeric" placeholder="001" className="min-w-0 flex-1 rounded-2xl border px-4 py-3" /></div><button disabled={busy || !nextCardCode} onClick={() => void handleNextCard()} className="mt-3 w-full rounded-2xl bg-black px-4 py-3 font-medium text-white disabled:opacity-40">Abrir siguiente carta</button></div> : null}
+      {effectiveMessage ? <p className="mt-5 text-sm font-medium text-red-600">{effectiveMessage}</p> : null}
+    </div></div></main>
   )
+}
+
+export default function ResultPage() {
+  return <Suspense fallback={<p className="p-6">Cargando resultado...</p>}><ResultContent /></Suspense>
 }
